@@ -252,6 +252,39 @@ class TestMineHardNegatives:
                 f"Batch size {bs}: Expected shape {(bs, self.out_dim)}, got {xt_neg.shape}"
 
 
+class TestEnergyDimensions:
+    """Test that energy dimensions are correct for noise contrastive loss."""
+    
+    def test_energy_stack_dimensions(self):
+        """Test that energy stacking produces correct dimensions for cross-entropy."""
+        batch_size = 2048
+        
+        # Simulate energy outputs from model (1D tensor)
+        energy = torch.randn(batch_size * 2)  # Concatenated batch
+        
+        # Split into real and fake
+        energy_real, energy_fake = torch.chunk(energy, 2, 0)
+        
+        # Ensure proper dimensions for stacking
+        if energy_real.dim() == 1:
+            energy_real = energy_real.unsqueeze(-1)
+            energy_fake = energy_fake.unsqueeze(-1)
+        
+        # Stack energies for binary classification
+        energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
+        
+        # Check dimensions
+        assert energy_stack.shape == (batch_size, 2), f"Expected shape ({batch_size}, 2), got {energy_stack.shape}"
+        
+        # Create target
+        target = torch.zeros(batch_size).long()
+        
+        # This should not raise an error
+        import torch.nn.functional as F
+        loss = F.cross_entropy(-1 * energy_stack, target)
+        assert loss.shape == torch.Size([]), "Loss should be a scalar"
+
+
 class TestOptimizeAdversarial:
     """Test the _optimize_adversarial method for shape consistency."""
     

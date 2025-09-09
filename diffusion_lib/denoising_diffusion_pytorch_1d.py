@@ -755,6 +755,10 @@ class GaussianDiffusion1D(nn.Module):
 
             # Compute noise contrastive energy loss
             energy_real, energy_fake = torch.chunk(energy, 2, 0)
+            # Ensure energies have shape [batch_size, 1] for proper stacking
+            if energy_real.dim() == 1:
+                energy_real = energy_real.unsqueeze(-1)
+                energy_fake = energy_fake.unsqueeze(-1)
             energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
             target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
             loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
