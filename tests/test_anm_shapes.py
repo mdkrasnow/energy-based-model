@@ -273,8 +273,9 @@ class TestOptimizeAdversarial:
         inp = torch.randn(self.batch_size, self.inp_dim)
         xt = torch.randn(self.batch_size, self.out_dim)
         t = torch.randint(0, self.diffusion.num_timesteps, (self.batch_size,))
+        x_start_xt = torch.randn(self.batch_size, self.out_dim)  # Ground truth in xt space
         
-        xt_optimized = self.anm._optimize_adversarial(inp, xt, t, mask=None, data_cond=None)
+        xt_optimized = self.anm._optimize_adversarial(inp, xt, x_start_xt, t, mask=None, data_cond=None)
         
         # Check shape preservation
         assert xt_optimized.shape == xt.shape, f"Expected shape {xt.shape}, got {xt_optimized.shape}"
@@ -287,10 +288,11 @@ class TestOptimizeAdversarial:
         inp = torch.randn(self.batch_size, self.inp_dim)
         xt = torch.randn(self.batch_size, self.out_dim)
         t = torch.randint(0, self.diffusion.num_timesteps, (self.batch_size,))
+        x_start_xt = torch.randn(self.batch_size, self.out_dim)  # Ground truth in xt space
         mask = torch.bernoulli(torch.ones(self.batch_size, self.out_dim) * 0.3)
         data_cond = torch.randn(self.batch_size, self.out_dim)
         
-        xt_optimized = self.anm._optimize_adversarial(inp, xt, t, mask=mask, data_cond=data_cond)
+        xt_optimized = self.anm._optimize_adversarial(inp, xt, x_start_xt, t, mask=mask, data_cond=data_cond)
         
         # Check shape preservation
         assert xt_optimized.shape == xt.shape, f"Expected shape {xt.shape}, got {xt_optimized.shape}"

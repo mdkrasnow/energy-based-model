@@ -295,6 +295,11 @@ class GaussianDiffusion1D(nn.Module):
                     step_size_multiplier=self.anm_step_mult,
                     adaptive_schedule="linear",
                     track_stats=True,
+                    projection_radius=0.2,
+                    projection_norm="l2",
+                    distance_penalty=0.25,
+                    use_ema_model=False,  # Will be set later if EMA is available
+                    ema_model=None,
                 )
             else:
                 self.anm_miner = AdversarialNegativeMiner(
@@ -302,7 +307,18 @@ class GaussianDiffusion1D(nn.Module):
                     search_steps=self.anm_steps,
                     step_size_multiplier=self.anm_step_mult,
                     track_stats=True,
+                    projection_radius=0.2,
+                    projection_norm="l2",
+                    distance_penalty=0.25,
+                    use_ema_model=False,  # Will be set later if EMA is available
+                    ema_model=None,
                 )
+    
+    def set_ema_model_for_anm(self, ema_model):
+        """Set the EMA model for ANM mining if enabled."""
+        if hasattr(self, 'anm_miner') and self.anm_miner is not None:
+            self.anm_miner.ema_model = ema_model
+            self.anm_miner.use_ema_model = True
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
@@ -692,6 +708,7 @@ class GaussianDiffusion1D(nn.Module):
                 loss_scale = 0.5
             else:
                 # Use ANM miner if enabled, otherwise fall back to opt_step
+                anm_stats = {}
                 if self.use_anm and self.anm_miner is not None:
                     # Mine hard negatives using ANM
                     xmin_noise, anm_stats = self.anm_miner.mine_hard_negatives(
@@ -699,12 +716,13 @@ class GaussianDiffusion1D(nn.Module):
                         x_start=x_start,
                         t=t,
                         mask=mask,
-                        noise=3.0 * noise,  # Use stronger noise for initial adversarial samples
+                        noise=noise,  # Use same noise for consistency
                     )
                     
-                    # Compute loss_opt for logging
-                    xmin = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-                    loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
+                    # Compute loss_opt for logging (compare in xt space)
+                    # xmin_noise is already in xt space from ANM
+                    x_start_xt = self.q_sample(x_start=x_start, t=t, noise=torch.zeros_like(noise))
+                    loss_opt = torch.pow(xmin_noise - x_start_xt, 2).mean()
                     
                     # NOTE: xmin_noise is already in xt space, do NOT re-noise it
                     # This is the critical fix - we use the adversarial xt directly
@@ -740,10 +758,22 @@ class GaussianDiffusion1D(nn.Module):
             energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
             target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
             loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+            
+            # Add margin loss to ensure energy separation
+            # We want: energy_real < energy_fake - margin
+            margin = 0.1  # Can be made configurable
+            energy_margin = F.relu(energy_real - energy_fake + margin)
+            loss_margin = energy_margin.mean(dim=0, keepdim=True)
 
-            # loss_energy = energy_real.mean() - energy_fake.mean()# loss_energy.mean()
-
-            loss = loss_mse + loss_scale * loss_energy # + 0.001 * loss_opt
+            # Combine losses
+            loss = loss_mse + loss_scale * (loss_energy + 0.1 * loss_margin)
+            
+            # Store ANM stats in loss_opt for monitoring (as a dict if available, else scalar)
+            if anm_stats:
+                # Include basic ANM stats in the loss_opt return
+                loss_opt_with_stats = loss_opt.mean()
+                # Can add more sophisticated logging here later
+            
             return loss.mean(), (loss_mse.mean(), loss_energy.mean(), loss_opt.mean())
         else:
             loss = loss_mse
@@ -878,6 +908,12 @@ class Trainer1D(object):
         if self.accelerator.is_main_process:
             self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
             self.ema.to(self.device)
+            
+            # Pass EMA model to ANM miner if available
+            if hasattr(diffusion_model, 'set_ema_model_for_anm'):
+                # We need to wrap the EMA model in a compatible wrapper
+                # For now, we'll use the model's forward directly
+                diffusion_model.set_ema_model_for_anm(self.ema.ema_model)
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)

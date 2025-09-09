@@ -799,14 +799,9 @@ class DiffusionWrapper(nn.Module):
     def forward(self, inp, opt_out, t, return_energy=False, return_both=False):
         opt_out.requires_grad_(True)
         
-        # Handle dimension mismatch: ensure both tensors have same number of dimensions
-        if inp.dim() != opt_out.dim():
-            # If opt_out has an extra singleton dimension, squeeze it
-            if opt_out.dim() == 3 and opt_out.shape[1] == 1:
-                opt_out = opt_out.squeeze(1)
-            # If inp has an extra singleton dimension, squeeze it (rare but handle for completeness)
-            elif inp.dim() == 3 and inp.shape[1] == 1:
-                inp = inp.squeeze(1)
+        # Ensure both tensors have compatible shapes for concatenation
+        assert inp.dim() == opt_out.dim(), f"Dimension mismatch: inp.dim()={inp.dim()}, opt_out.dim()={opt_out.dim()}"
+        assert inp.shape[0] == opt_out.shape[0], f"Batch size mismatch: inp.shape={inp.shape}, opt_out.shape={opt_out.shape}"
         
         opt_variable = torch.cat([inp, opt_out], dim=-1)
 
