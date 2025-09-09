@@ -1,0 +1,12 @@
+accelerate==1.10.1
+dataset==1.6.2
+einops==0.8.1
+ema_pytorch==0.7.7
+ipdb==0.13.13
+ipython==8.12.3
+mkl==2025.2.0
+numpy==1.24.3
+pandas==2.0.3
+tabulate==0.9.0
+torch==2.7.1
+tqdm==4.67.1
