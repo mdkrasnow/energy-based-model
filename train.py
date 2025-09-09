@@ -54,6 +54,13 @@ parser.add_argument('--latent', action='store_true', default=False)
 parser.add_argument('--ood', action='store_true', default=False)
 parser.add_argument('--baseline', action='store_true', default=False)
 
+# Adversarial Negative Mining (ANM) parameters
+parser.add_argument('--use-anm', type=str2bool, default=False, help='Enable Adversarial Negative Mining')
+parser.add_argument('--anm-steps', type=int, default=10, help='Number of ANM optimization steps')
+parser.add_argument('--anm-step-mult', type=float, default=1.0, help='ANM step size multiplier')
+parser.add_argument('--anm-loss-weight', type=float, default=0.5, help='Weight for energy loss when ANM is active')
+parser.add_argument('--anm-adaptive', type=str2bool, default=False, help='Enable timestep-aware ANM step sizing')
+
 
 if __name__ == "__main__":
     FLAGS = parser.parse_args()
@@ -261,6 +268,14 @@ if __name__ == "__main__":
 
     if FLAGS.dataset in ['shortest-path', 'shortest-path-1d']:
         kwargs['shortest_path'] = True
+    
+    # Add ANM parameters if enabled
+    if FLAGS.use_anm:
+        kwargs['use_anm'] = True
+        kwargs['anm_steps'] = FLAGS.anm_steps
+        kwargs['anm_step_mult'] = FLAGS.anm_step_mult
+        kwargs['anm_loss_weight'] = FLAGS.anm_loss_weight
+        kwargs['anm_adaptive'] = FLAGS.anm_adaptive
 
     diffusion = GaussianDiffusion1D(
         model,

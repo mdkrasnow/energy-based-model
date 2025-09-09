@@ -25,6 +25,9 @@ import os.path as osp
 import time
 import numpy as np
 
+# Import ANM utilities
+from adversarial_negative_mining.anm_utils import AdversarialNegativeMiner, AdaptiveANM
+
 
 def _custom_exception_hook(type, value, tb):
     if hasattr(sys, 'ps1') or not sys.stderr.isatty():
@@ -178,6 +181,12 @@ class GaussianDiffusion1D(nn.Module):
         continuous = False,
         connectivity = False,
         shortest_path = False,
+        # ANM parameters
+        use_anm = False,
+        anm_steps = 10,
+        anm_step_mult = 1.0,
+        anm_loss_weight = 0.5,
+        anm_adaptive = False,
     ):
         super().__init__()
         self.model = model
@@ -192,6 +201,14 @@ class GaussianDiffusion1D(nn.Module):
         self.objective = objective
         self.show_inference_tqdm = show_inference_tqdm
         assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
+
+        # Store ANM parameters
+        self.use_anm = use_anm
+        self.anm_steps = anm_steps
+        self.anm_step_mult = anm_step_mult
+        self.anm_loss_weight = anm_loss_weight
+        self.anm_adaptive = anm_adaptive
+        self.anm_miner = None  # Will be initialized later
 
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
@@ -268,6 +285,24 @@ class GaussianDiffusion1D(nn.Module):
 
         register_buffer('loss_weight', loss_weight)
         # whether to autonormalize
+        
+        # Initialize ANM miner if enabled
+        if self.use_anm and self.supervise_energy_landscape:
+            if self.anm_adaptive:
+                self.anm_miner = AdaptiveANM(
+                    diffusion=self,
+                    search_steps=self.anm_steps,
+                    step_size_multiplier=self.anm_step_mult,
+                    adaptive_schedule="linear",
+                    track_stats=True,
+                )
+            else:
+                self.anm_miner = AdversarialNegativeMiner(
+                    diffusion=self,
+                    search_steps=self.anm_steps,
+                    step_size_multiplier=self.anm_step_mult,
+                    track_stats=True,
+                )
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
@@ -379,12 +414,13 @@ class GaussianDiffusion1D(nn.Module):
                 if mask is not None:
                     img_new = img_new * (1 - mask) + mask * data_cond
 
+                # Determine clamping scale factor based on task type
                 if self.continuous:
-                    sf = 2.0
+                    clamp_sf = 2.0
                 else:
-                    sf = 1.0
+                    clamp_sf = 1.0
 
-                max_val = extract(self.sqrt_alphas_cumprod, t, img_new.shape)[0, 0] * sf
+                max_val = extract(self.sqrt_alphas_cumprod, t, img_new.shape)[0, 0] * clamp_sf
                 img_new = torch.clamp(img_new, -max_val, max_val)
 
                 energy_new = self.model(inp, img_new, t, return_energy=True)
@@ -655,28 +691,39 @@ class GaussianDiffusion1D(nn.Module):
 
                 loss_scale = 0.5
             else:
+                # Use ANM miner if enabled, otherwise fall back to opt_step
+                if self.use_anm and self.anm_miner is not None:
+                    # Mine hard negatives using ANM
+                    xmin_noise, anm_stats = self.anm_miner.mine_hard_negatives(
+                        inp=inp,
+                        x_start=x_start,
+                        t=t,
+                        mask=mask,
+                        noise=3.0 * noise,  # Use stronger noise for initial adversarial samples
+                    )
+                    
+                    # Compute loss_opt for logging
+                    xmin = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+                    loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
+                    
+                    # NOTE: xmin_noise is already in xt space, do NOT re-noise it
+                    # This is the critical fix - we use the adversarial xt directly
+                    loss_scale = self.anm_loss_weight
+                    
+                else:
+                    # Original code path when ANM is not used
+                    xmin_noise = self.opt_step(inp, xmin_noise, t, mask, data_cond, step=2, sf=1.0)
+                    xmin = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+                    loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
 
-                xmin_noise = self.opt_step(inp, xmin_noise, t, mask, data_cond, step=2, sf=1.0)
-                xmin = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-                loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
-
-                xmin_noise = xmin_noise.detach()
-                xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, t, torch.zeros_like(xmin_noise))
-                xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
-
-                # loss_opt = torch.ones(1)
-
-
-                # rand_mask = (torch.rand(x_start.size(), device=x_start.device) < 0.2).float()
-
-                # xmin_noise_rescale =  x_start * (1 - rand_mask) + rand_mask * x_start_noise
-
-                # nrep = 1
-
-
-                loss_scale = 0.5
-
-            xmin_noise = self.q_sample(x_start=xmin_noise_rescale, t=t, noise=noise)
+                    xmin_noise = xmin_noise.detach()
+                    xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, t, torch.zeros_like(xmin_noise))
+                    xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
+                    
+                    loss_scale = 0.5
+                    
+                    # Re-noise only when NOT using ANM
+                    xmin_noise = self.q_sample(x_start=xmin_noise_rescale, t=t, noise=noise)
 
             if mask is not None:
                 xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
