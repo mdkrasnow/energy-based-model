@@ -219,8 +219,12 @@ class AdversarialNegativeMiner:
                             bad_step = (energy_new > energy).reshape(-1)
                             
                         # Keep old xt for samples where energy increased
+                        # Unsqueeze to match xt dimensions
+                        bad_step_expanded = bad_step
+                        for _ in range(len(xt.shape) - 1):
+                            bad_step_expanded = bad_step_expanded.unsqueeze(-1)
                         xt_new = torch.where(
-                            bad_step.unsqueeze(-1).unsqueeze(-1),
+                            bad_step_expanded,
                             xt,
                             xt_new
                         )
