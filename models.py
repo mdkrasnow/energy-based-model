@@ -208,7 +208,7 @@ class EBM(nn.Module):
         h = swish(self.fc3(h) * (fc3_gain + 1) + fc3_bias)
 
         if self.is_ebm:
-            output = self.fc4(h).pow(2).sum(dim=-1)[..., None]
+            output = self.fc4(h).pow(2).sum(dim=-1)
         else:
             output = self.fc4(h)
 

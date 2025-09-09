@@ -106,7 +106,7 @@ class AdversarialNegativeMiner:
             noise = torch.randn_like(x_start)
         
         # Store ground truth in xt space for distance penalty
-        x_start_xt = self.diffusion.q_sample(x_start=x_start, t=t, noise=torch.zeros_like(noise))
+        x_start_xt = extract(self.diffusion.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             
         # Initialize xt based on strategy
         if self.init_strategy == "noisy":
@@ -248,8 +248,8 @@ class AdversarialNegativeMiner:
                 if self.distance_penalty > 0:
                     with torch.no_grad():
                         # Add penalty gradient to push away from ground truth
-                        distance_grad = 2 * self.distance_penalty * (xt - x_start_xt)
-                        grad = grad - distance_grad
+                        distance_grad = -2 * self.distance_penalty * (xt - x_start_xt)
+                        grad = grad + distance_grad
                 
                 # Take a gradient step to minimize energy (find harder negatives)
                 with torch.no_grad():
@@ -275,8 +275,7 @@ class AdversarialNegativeMiner:
                     
                 # Get max value for clamping (use first element of batch)
                 sqrt_alpha = extract(self.diffusion.sqrt_alphas_cumprod, t, xt.shape)
-                max_val = sqrt_alpha.view(sqrt_alpha.shape[0], -1).max(dim=1, keepdim=True)[0] * sf
-                max_val = max_val.view(-1, *([1] * (len(xt.shape) - 1)))
+                max_val = sqrt_alpha * sf
                 xt_new = torch.clamp(xt_new, -max_val, max_val)
                 
                 # Check if energy decreased (for adaptive steps)

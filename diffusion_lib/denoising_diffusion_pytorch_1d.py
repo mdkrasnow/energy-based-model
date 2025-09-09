@@ -721,7 +721,7 @@ class GaussianDiffusion1D(nn.Module):
                     
                     # Compute loss_opt for logging (compare in xt space)
                     # xmin_noise is already in xt space from ANM
-                    x_start_xt = self.q_sample(x_start=x_start, t=t, noise=torch.zeros_like(noise))
+                    x_start_xt = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
                     loss_opt = torch.pow(xmin_noise - x_start_xt, 2).mean()
                     
                     # NOTE: xmin_noise is already in xt space, do NOT re-noise it
@@ -763,7 +763,7 @@ class GaussianDiffusion1D(nn.Module):
             # We want: energy_real < energy_fake - margin
             margin = 0.1  # Can be made configurable
             energy_margin = F.relu(energy_real - energy_fake + margin)
-            loss_margin = energy_margin.mean(dim=0, keepdim=True)
+            loss_margin = energy_margin.mean()
 
             # Combine losses
             loss = loss_mse + loss_scale * (loss_energy + 0.1 * loss_margin)
@@ -910,10 +910,13 @@ class Trainer1D(object):
             self.ema.to(self.device)
             
             # Pass EMA model to ANM miner if available
-            if hasattr(diffusion_model, 'set_ema_model_for_anm'):
-                # We need to wrap the EMA model in a compatible wrapper
-                # For now, we'll use the model's forward directly
-                diffusion_model.set_ema_model_for_anm(self.ema.ema_model)
+            # TODO: Fix EMA model interface issue - self.ema.ema_model may not have the correct
+            # DiffusionWrapper interface expected by ANM (return_both=True, return_energy=True)
+            # Need to verify/ensure EMA model has proper wrapper interface before enabling
+            # if hasattr(diffusion_model, 'set_ema_model_for_anm'):
+            #     # We need to wrap the EMA model in a compatible wrapper
+            #     # For now, we'll use the model's forward directly
+            #     diffusion_model.set_ema_model_for_anm(self.ema.ema_model)
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
