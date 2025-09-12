@@ -281,7 +281,7 @@ if __name__ == "__main__":
         train_lr = 1e-4,
         train_num_steps = 1300000,         # total training steps
         gradient_accumulate_every = 1,    # gradient accumulation steps
-        ema_decay = 0.995,                # exponential moving average decay
+        ema_decay = 0.995,                # exponential moving average decay e
         data_workers = FLAGS.data_workers,
         amp = False,                      # turn on mixed precision
         metric = metric,

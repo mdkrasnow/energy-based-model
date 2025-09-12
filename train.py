@@ -12,7 +12,7 @@ from models import SudokuEBM, SudokuTransformerEBM, SudokuDenoise, SudokuLatentE
 from models import GraphEBM, GraphReverse, GNNConvEBM, GNNDiffusionWrapper, GNNConvDiffusionWrapper, GNNConv1DEBMV2, GNNConv1DV2DiffusionWrapper, GNNConv1DReverse
 from dataset import Addition, LowRankDataset, Inverse
 from reasoning_dataset import FamilyTreeDataset, GraphConnectivityDataset, FamilyDatasetWrapper, GraphDatasetWrapper
-from planning_dataset import PlanningDataset, PlanningDatasetOnline
+# from planning_dataset import PlanningDataset, PlanningDatasetOnline  # Commented out - module not available
 from sat_dataset import SATNetDataset, SudokuDataset, SudokuRRNDataset, SudokuRRNLatentDataset
 import torch
 
@@ -53,6 +53,18 @@ parser.add_argument('--evaluate', action='store_true', default=False)
 parser.add_argument('--latent', action='store_true', default=False)
 parser.add_argument('--ood', action='store_true', default=False)
 parser.add_argument('--baseline', action='store_true', default=False)
+
+# --- SANS (Self-Adversarial Negative Sampling) ---
+parser.add_argument('--sans', type=str2bool, default=False,
+                    help='enable self-adversarial negative sampling (RotatE-style weights over mined negatives)')
+parser.add_argument('--sans-num-negs', type=int, default=4,
+                    help='number of candidate negatives per item (M)')
+parser.add_argument('--sans-temp', type=float, default=1.0,
+                    help='adversarial temperature α (RotatE typically uses ~1.0)')
+parser.add_argument('--sans-temp-schedule', type=str2bool, default=True,
+                    help='linearly decay α with timestep t (on by default)')
+parser.add_argument('--sans-chunk', type=int, default=0,
+                    help='optional chunk size over negatives to bound memory; 0 = auto')
 
 
 if __name__ == "__main__":
@@ -271,6 +283,12 @@ if __name__ == "__main__":
         supervise_energy_landscape = FLAGS.supervise_energy_landscape,
         use_innerloop_opt = FLAGS.use_innerloop_opt,
         show_inference_tqdm = False,
+        # SANS wiring (constructor, not attribute injection)
+        sans_enabled=FLAGS.sans,
+        sans_num_negs=FLAGS.sans_num_negs,
+        sans_temp=FLAGS.sans_temp,
+        sans_temp_schedule=FLAGS.sans_temp_schedule,
+        sans_chunk=FLAGS.sans_chunk,
         **kwargs
     )
 
