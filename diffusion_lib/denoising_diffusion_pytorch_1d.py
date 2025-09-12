@@ -582,10 +582,12 @@ class GaussianDiffusion1D(nn.Module):
         alpha = torch.as_tensor(self.sans_temp, dtype=torch.float32, device=t.device)
         if not self.sans_temp_schedule:
             return alpha.view(1, 1)  # broadcast later
-        # linear decay with timestep (RotatE uses constant α; we optionally schedule for diffusion)
-        denom = max(1, int(self.num_timesteps))
-        frac = 1.0 - t.float().view(-1, 1) / float(denom - 1)
-        return (alpha * frac).clamp(min=0.0)  # [B,1]
+        # linear INCREASE with timestep to focus more on hard negatives as training progresses
+        # At t=0 (early timesteps): low alpha (more uniform sampling)
+        # At t=num_timesteps-1 (late timesteps): high alpha (focus on hard negatives)
+        denom = max(1, int(self.num_timesteps - 1))
+        frac = t.float().view(-1, 1) / float(denom)
+        return (alpha * frac).clamp(min=0.1)  # [B,1] - keep minimum of 0.1 to avoid uniform at t=0
 
     def _energy_reduce(self, e, b):
         """
@@ -732,11 +734,14 @@ class GaussianDiffusion1D(nn.Module):
                         else:
                             energy_negs = eval_neg_energy(x_negs)
                     
-                    neg_logits = -energy_negs  # higher logit = harder negative
-                    # α schedule (per-batch) and detached weights
+                    # For energy-based models: LOWER energy = BETTER
+                    # Hard negatives have LOW energy (close to real samples) 
+                    # We want HIGHER weights for HARDER (lower energy) negatives
+                    # So negate energy: lower energy → higher logit → higher softmax weight
+                    neg_logits = -energy_negs  # Convert to logits where higher = harder
                     alpha_eff = self._alpha_effective(t)           # [B,1]
-                    logits_scaled = neg_logits.detach() * alpha_eff
-                    w = torch.softmax(logits_scaled, dim=1)        # [B,M]
+                    logits_scaled = neg_logits * alpha_eff
+                    w = torch.softmax(logits_scaled, dim=1).detach()  # [B,M] - detach AFTER computing
                     weighted_neg_logit = torch.logsumexp(neg_logits + self._clamp_log(w), dim=1, keepdim=True)  # [B,1]
                     logits = torch.cat([-energy_real, weighted_neg_logit], dim=1)  # [B,2]
                     target = torch.zeros(B, dtype=torch.long, device=logits.device)

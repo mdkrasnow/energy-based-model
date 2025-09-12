@@ -59,8 +59,8 @@ parser.add_argument('--metrics-file', type=str, default=None, help='Path to save
 # --- SANS (Self-Adversarial Negative Sampling) ---
 parser.add_argument('--sans', type=str2bool, default=False,
                     help='enable self-adversarial negative sampling (RotatE-style weights over mined negatives)')
-parser.add_argument('--sans-num-negs', type=int, default=4,
-                    help='number of candidate negatives per item (M)')
+parser.add_argument('--sans-num-negs', type=int, default=16,
+                    help='number of candidate negatives per item (M) - increased from 4 to 16 for better SANS performance')
 parser.add_argument('--sans-temp', type=float, default=1.0,
                     help='adversarial temperature α (RotatE typically uses ~1.0)')
 parser.add_argument('--sans-temp-schedule', type=str2bool, default=True,
@@ -331,8 +331,7 @@ if __name__ == "__main__":
         save_and_sample_every = save_and_sample_every,
         evaluate_first = FLAGS.evaluate,  # run one evaluation first
         latent = FLAGS.latent,  # whether we are doing reasoning in the latent space
-        autoencode_model = autoencode_model,
-        metrics_file = FLAGS.metrics_file  # Add metrics export path
+        autoencode_model = autoencode_model
     )
 
     if FLAGS.load_milestone is not None:
