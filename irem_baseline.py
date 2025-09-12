@@ -53,6 +53,8 @@ parser.add_argument('--evaluate', action='store_true', default=False)
 parser.add_argument('--latent', action='store_true', default=False)
 parser.add_argument('--ood', action='store_true', default=False)
 parser.add_argument('--baseline', action='store_true', default=False)
+parser.add_argument('--max-steps', type=int, default=None, help='Maximum training steps (for smoke tests)')
+parser.add_argument('--metrics-file', type=str, default=None, help='Path to save training metrics CSV')
 
 
 if __name__ == "__main__":
@@ -273,13 +275,16 @@ if __name__ == "__main__":
     else:
         autoencode_model = None
 
+    # Use max_steps if provided, otherwise default
+    train_steps = FLAGS.max_steps if FLAGS.max_steps is not None else 1300000
+    
     trainer = Trainer1D(
         model,
         dataset,
         train_batch_size = FLAGS.batch_size,
         validation_batch_size = validation_batch_size,
         train_lr = 1e-4,
-        train_num_steps = 1300000,         # total training steps
+        train_num_steps = train_steps,         # total training steps
         gradient_accumulate_every = 1,    # gradient accumulation steps
         ema_decay = 0.995,                # exponential moving average decay e
         data_workers = FLAGS.data_workers,
@@ -292,6 +297,7 @@ if __name__ == "__main__":
         extra_validation_every_mul = extra_validation_every_mul,
         save_and_sample_every = save_and_sample_every,
         evaluate_first = FLAGS.evaluate,  # run one evaluation first
+        metrics_file = FLAGS.metrics_file  # Add metrics export path
     )
 
     if FLAGS.load_milestone is not None:
