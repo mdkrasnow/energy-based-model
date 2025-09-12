@@ -743,12 +743,16 @@ class GaussianDiffusion1D(nn.Module):
                     
                     # Memory-aware energy evaluation over negatives
                     def eval_neg_energy(xn):
-                        # expand (no physical copy) then reshape to [B*M,...]
-                        inp_bm = inp.unsqueeze(1).expand(B, M, *inp.shape[1:]).reshape(B * M, *inp.shape[1:])
-                        t_bm = t.view(B, 1).expand(B, M).reshape(B * M)
-                        e_raw = self.model(inp_bm, xn.reshape(B * M, *xn.shape[2:]), t_bm, return_energy=True)
-                        e = e_raw if e_raw.dim() == 1 else e_raw.view(B * M, -1).mean(dim=1)
-                        return e.view(B, M)  # [B,M]
+                        # xn shape: [B, M_chunk, ...] where M_chunk might be < M
+                        B_local, M_local = xn.shape[:2]
+                        # expand (no physical copy) then reshape to [B*M_local,...]
+                        inp_bm = inp.unsqueeze(1).expand(B_local, M_local, *inp.shape[1:]).reshape(B_local * M_local, *inp.shape[1:])
+                        t_bm = t.view(B_local, 1).expand(B_local, M_local).reshape(B_local * M_local)
+                        # Fix: flatten all dimensions after B*M to avoid shape mismatch
+                        xn_flat = xn.reshape(B_local * M_local, -1)
+                        e_raw = self.model(inp_bm, xn_flat, t_bm, return_energy=True)
+                        e = e_raw if e_raw.dim() == 1 else e_raw.view(B_local * M_local, -1).mean(dim=1)
+                        return e.view(B_local, M_local)  # [B, M_local]
                     
                     if self.sans_chunk and M > self.sans_chunk:
                         chunks = []
