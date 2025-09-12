@@ -9,6 +9,7 @@ from random import random
 from functools import partial
 from collections import namedtuple
 from tabulate import tabulate
+import csv
 
 import torch
 from accelerate import Accelerator
@@ -270,6 +271,11 @@ class Trainer1D(object):
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
         self.evaluate_first = evaluate_first
+        
+        # Initialize metrics tracking
+        self.metrics_file = self.results_folder / 'metrics.csv'
+        self.metrics_data = []
+        self.start_time = None
 
     @property
     def device(self):
@@ -333,7 +339,15 @@ class Trainer1D(object):
             self.evaluate(device, milestone)
             self.evaluate_first = False  # hack: later we will use this flag as a bypass signal to determine whether we want to run extra validation.
 
+        self.start_time = time.time()
         end_time = time.time()
+        
+        # Initialize CSV file with headers
+        if accelerator.is_main_process and self.step == 0:
+            with open(self.metrics_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['step', 'loss', 'val_loss', 'lr', 'time'])
+        
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process, dynamic_ncols = True) as pbar:
 
             while self.step < self.train_num_steps:
@@ -386,22 +400,59 @@ class Trainer1D(object):
 
                 self.step += 1
                 if accelerator.is_main_process:
+                    # Log metrics to CSV
+                    current_lr = self.opt.param_groups[0]['lr']
+                    elapsed_time = time.time() - self.start_time
+                    
+                    # We'll update val_loss when we evaluate
+                    metrics_row = {
+                        'step': self.step,
+                        'loss': total_loss,
+                        'val_loss': None,  # Will be updated during evaluation
+                        'lr': current_lr,
+                        'time': elapsed_time
+                    }
+                    self.metrics_data.append(metrics_row)
+                    
+                    # Write to CSV periodically
+                    if self.step % 100 == 0 or self.step == self.train_num_steps:
+                        self._write_metrics_to_csv()
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         milestone = self.step // self.save_and_sample_every
                         self.save(milestone)
 
                         if self.cond_mask:
-                            self.evaluate(device, milestone, inp=inp, label=label, mask=mask)
+                            val_loss = self.evaluate(device, milestone, inp=inp, label=label, mask=mask)
                         else:
-                            self.evaluate(device, milestone, inp=inp, label=label)
+                            val_loss = self.evaluate(device, milestone, inp=inp, label=label)
+                        
+                        # Update the last metrics row with validation loss
+                        if val_loss is not None and len(self.metrics_data) > 0:
+                            self.metrics_data[-1]['val_loss'] = val_loss
+                            self._write_metrics_to_csv()
 
                 pbar.update(1)
 
         accelerator.print('training complete')
+        
+        # Write final metrics
+        if accelerator.is_main_process:
+            self._write_metrics_to_csv()
+    
+    def _write_metrics_to_csv(self):
+        """Write accumulated metrics to CSV file"""
+        if len(self.metrics_data) == 0:
+            return
+            
+        with open(self.metrics_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['step', 'loss', 'val_loss', 'lr', 'time'])
+            writer.writeheader()
+            writer.writerows(self.metrics_data)
 
     def evaluate(self, device, milestone, inp=None, label=None, mask=None):
         print('Running Evaluation...')
+        val_loss = None
 
         if inp is not None and label is not None:
             with torch.no_grad():
@@ -416,6 +467,7 @@ class Trainer1D(object):
                 if self.metric == 'mse':
                     all_samples = torch.cat(all_samples_list, dim = 0)
                     mse_error = (all_samples - label).pow(2).mean()
+                    val_loss = mse_error.item()
                     rows = [('mse_error', mse_error)]
                     print(tabulate(rows))
                 elif self.metric == 'bce':
@@ -455,11 +507,15 @@ class Trainer1D(object):
                     raise NotImplementedError()
 
         if self.validation_dl is not None:
-            self._run_validation(self.validation_dl, device, milestone, prefix = 'Validation')
+            val_loss_from_validation = self._run_validation(self.validation_dl, device, milestone, prefix = 'Validation')
+            if val_loss_from_validation is not None:
+                val_loss = val_loss_from_validation
 
         if (self.step % (self.save_and_sample_every * self.extra_validation_every_mul) == 0 and self.extra_validation_dls is not None) or self.evaluate_first:
             for key, extra_dl in self.extra_validation_dls.items():
                 self._run_validation(extra_dl, device, milestone, prefix = key)
+        
+        return val_loss
 
     def _run_validation(self, dl, device, milestone, prefix='Validation'):
         meters = collections.defaultdict(AverageMeter)
@@ -521,6 +577,13 @@ class Trainer1D(object):
         rows = [[k, v.avg] for k, v in meters.items()]
         print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (ID: {prefix})')
         print(tabulate(rows))
+        
+        # Return validation loss if available
+        if 'mse' in meters:
+            return meters['mse'].avg
+        elif 'accuracy' in meters:
+            return 1.0 - meters['accuracy'].avg  # Convert accuracy to loss
+        return None
 
 
 as_float = lambda x: float(x.item())

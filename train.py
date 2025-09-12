@@ -61,7 +61,7 @@ parser.add_argument('--sans', type=str2bool, default=False,
                     help='enable self-adversarial negative sampling (RotatE-style weights over mined negatives)')
 parser.add_argument('--sans-num-negs', type=int, default=16,
                     help='number of candidate negatives per item (M) - increased from 4 to 16 for better SANS performance')
-parser.add_argument('--sans-temp', type=float, default=1.0,
+parser.add_argument('--sans-temp', type=float, default=2.0,
                     help='adversarial temperature α (RotatE typically uses ~1.0)')
 parser.add_argument('--sans-temp-schedule', type=str2bool, default=True,
                     help='linearly decay α with timestep t (on by default)')

@@ -8,6 +8,7 @@ from random import random
 from functools import partial
 from collections import namedtuple
 from tabulate import tabulate
+import csv
 
 import torch
 from accelerate import Accelerator
@@ -181,7 +182,7 @@ class GaussianDiffusion1D(nn.Module):
         shortest_path = False,
         sans_enabled = False,
         sans_num_negs = 4,
-        sans_temp = 1.0,
+        sans_temp = 2.0,
         sans_temp_schedule = True,
         sans_chunk = 0,
     ):
@@ -576,18 +577,34 @@ class GaussianDiffusion1D(nn.Module):
 
     def _alpha_effective(self, t):
         """
-        Returns α (adversarial temperature) possibly scheduled over t.
-        t: shape [B] or [B,1], integer timesteps in [0, num_timesteps-1]
+        Returns α (adversarial temperature) possibly scheduled over diffusion timestep t.
+        
+        The temperature controls how much SANS focuses on hard negatives:
+        - Low α (≈0.1): More uniform weighting across all negatives
+        - High α (≈1.0): Strong focus on the hardest negatives
+        
+        Schedule rationale:
+        - Early timesteps (t≈0): High α to focus on hard negatives during critical denoising
+        - Late timesteps (t≈T-1): Lower α for stable gradients on noisy data
+        
+        In diffusion models, t=0 is the clean state requiring precise discrimination,
+        while t=T is fully noisy where discrimination is less critical.
+        
+        Args:
+            t: shape [B] or [B,1], integer timesteps in [0, num_timesteps-1]
+        
+        Returns:
+            alpha_eff: shape [B,1], effective temperature for each sample
         """
         alpha = torch.as_tensor(self.sans_temp, dtype=torch.float32, device=t.device)
         if not self.sans_temp_schedule:
-            return alpha.view(1, 1)  # broadcast later
-        # linear INCREASE with timestep to focus more on hard negatives as training progresses
-        # At t=0 (early timesteps): low alpha (more uniform sampling)
-        # At t=num_timesteps-1 (late timesteps): high alpha (focus on hard negatives)
+            return alpha.view(1, 1)  # Use constant temperature
+        
+        # Reverse linear schedule: α(t) = base_α * (1 - t/T)
+        # This gives strong focus on hard negatives early, relaxing as noise increases
         denom = max(1, int(self.num_timesteps - 1))
-        frac = t.float().view(-1, 1) / float(denom)
-        return (alpha * frac).clamp(min=0.1)  # [B,1] - keep minimum of 0.1 to avoid uniform at t=0
+        frac = 1.0 - (t.float().view(-1, 1) / float(denom))  # Reverse: 1 at t=0, 0 at t=T
+        return (alpha * frac).clamp(min=0.1)  # Keep min=0.1 to avoid completely uniform
 
     def _energy_reduce(self, e, b):
         """
@@ -602,10 +619,22 @@ class GaussianDiffusion1D(nn.Module):
 
     def _build_one_negative(self, x_start, noise, t, inp, mask):
         """
-        Mirrors the existing task-specific negative generation,
-        returning a single negative sample with the same shape as x_start.
+        Generates a single negative sample for contrastive learning.
+        
+        A good negative sampling strategy should create samples that:
+        1. Are definitely incorrect (not valid solutions)
+        2. Range from easy (very different from real) to hard (similar to real)
+        3. Cover the space of plausible mistakes the model might make
+        
+        Task-specific strategies:
+        - Sudoku: Random digit replacements (violates constraints)
+        - Connectivity: Perturbed graphs (breaks connectivity)  
+        - Continuous: Optimization-based (finds low-energy incorrect points)
+        
+        Returns:
+            A negative sample with the same shape as x_start
         """
-        # NOTE: reuses existing branches (sudoku / connectivity / shortest_path / continuous)
+        # NOTE: Task-specific negative generation follows
         if self.sudoku:
             s = x_start.size()
             x_start_im = x_start.view(-1, 9, 9, 9).argmax(dim=-1)
@@ -734,20 +763,67 @@ class GaussianDiffusion1D(nn.Module):
                         else:
                             energy_negs = eval_neg_energy(x_negs)
                     
-                    # For energy-based models: LOWER energy = BETTER
-                    # Hard negatives have LOW energy (close to real samples) 
-                    # We want HIGHER weights for HARDER (lower energy) negatives
-                    # So negate energy: lower energy → higher logit → higher softmax weight
-                    neg_logits = -energy_negs  # Convert to logits where higher = harder
-                    alpha_eff = self._alpha_effective(t)           # [B,1]
+                    # === SANS (Self-Adversarial Negative Sampling) Weight Computation ===
+                    # 
+                    # Energy Convention: LOWER energy = BETTER (more likely to be real)
+                    # - Real/positive samples have LOW energy
+                    # - Good negatives (easy to reject) have HIGH energy  
+                    # - Hard negatives (difficult to distinguish) have LOW energy
+                    #
+                    # SANS Goal: Focus training on hard negatives that are most confusable with positives
+                    #
+                    # Step 1: Convert energies to logits for weighting
+                    # Since lower energy = harder negative, we negate to get higher logits for harder samples
+                    neg_logits = -energy_negs  # [B,M] where higher value = harder negative
+                    
+                    # Step 2: Apply temperature-controlled softmax to get sampling weights
+                    alpha_eff = self._alpha_effective(t)  # [B,1] temperature (increases over timesteps)
                     logits_scaled = neg_logits * alpha_eff
-                    w = torch.softmax(logits_scaled, dim=1).detach()  # [B,M] - detach AFTER computing
+                    # Higher alpha → more peaked distribution → more focus on hardest negatives
+                    w = torch.softmax(logits_scaled, dim=1).detach()  # [B,M]
+                    # CRITICAL: Detach AFTER softmax to prevent gradients through sampling distribution
+                    
+                    # Step 3: Compute weighted negative term for contrastive loss
+                    # This aggregates all negatives with emphasis on harder ones
                     weighted_neg_logit = torch.logsumexp(neg_logits + self._clamp_log(w), dim=1, keepdim=True)  # [B,1]
                     logits = torch.cat([-energy_real, weighted_neg_logit], dim=1)  # [B,2]
                     target = torch.zeros(B, dtype=torch.long, device=logits.device)
                     loss_energy = F.cross_entropy(logits, target, reduction='none')[:, None]
                     loss_opt = torch.ones(1).to(x_start.device) # dummy loss_opt for compatibility
                     loss_scale = 0.5  # default loss scale
+                    
+                    # DEBUG: SANS instrumentation
+                    if torch.rand(1).item() < 0.01:  # Log 1% of the time randomly
+                        with torch.no_grad():
+                            # Negative distance stats
+                            neg_distance = energy_negs  # [B,M] - lower is harder
+                            print(f"\n[SANS Debug]")
+                            print(f"  Neg energy: mean={neg_distance.mean():.4f}, min={neg_distance.min():.4f}, max={neg_distance.max():.4f}, std={neg_distance.std():.4f}")
+                            print(f"  Real energy: mean={energy_real.mean():.4f}, min={energy_real.min():.4f}, max={energy_real.max():.4f}")
+                            print(f"  K={M}, B={B}")
+                            
+                            # Weight sanity check
+                            w_sum = w.sum(dim=-1)
+                            print(f"  Weight sum: mean={w_sum.mean():.4f}, min={w_sum.min():.4f}, max={w_sum.max():.4f} (should be 1.0)")
+                            print(f"  Weight shape: {w.shape}, requires_grad={w.requires_grad}")
+                            
+                            # Correlation between weights and hardness
+                            # For energy (lower=harder), correlation should be negative
+                            w_flat = w.flatten()
+                            e_flat = energy_negs.flatten()
+                            if len(w_flat) > 1:
+                                corr = torch.corrcoef(torch.stack([w_flat, e_flat]))[0, 1]
+                                print(f"  Corr(weight, energy): {corr:.4f} (should be negative)")
+                            
+                            # Weight entropy
+                            entropy = -(w * torch.log(w + 1e-10)).sum(dim=-1).mean()
+                            max_entropy = torch.log(torch.tensor(M, dtype=torch.float32))
+                            print(f"  Weight entropy: {entropy:.4f} (max={max_entropy:.4f}, ratio={entropy/max_entropy:.2f})")
+                            
+                            # Temperature schedule
+                            alpha_eff_val = alpha_eff.mean()
+                            print(f"  Alpha (temp): {alpha_eff_val:.4f}, t_mean={t.float().mean():.1f}")
+                            print(f"  Loss components: denoise={loss_mse.mean():.4f}, energy={loss_energy.mean():.4f}, opt={loss_opt.mean():.4f}")
             
             if not self.sans_enabled:
                 # --- baseline single-negative path (unchanged behavior) ---
@@ -927,6 +1003,11 @@ class Trainer1D(object):
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
         self.evaluate_first = evaluate_first
+        
+        # Initialize metrics tracking
+        self.metrics_file = self.results_folder / 'metrics.csv'
+        self.metrics_data = []
+        self.start_time = None
 
     @property
     def device(self):
@@ -976,7 +1057,15 @@ class Trainer1D(object):
             self.evaluate(device, milestone)
             self.evaluate_first = False  # hack: later we will use this flag as a bypass signal to determine whether we want to run extra validation.
 
+        self.start_time = time.time()
         end_time = time.time()
+        
+        # Initialize CSV file with headers
+        if accelerator.is_main_process and self.step == 0:
+            with open(self.metrics_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['step', 'loss', 'loss_denoise', 'loss_energy', 'loss_opt', 'val_loss', 'lr', 'time'])
+        
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process, dynamic_ncols = True) as pbar:
 
             while self.step < self.train_num_steps:
@@ -1024,6 +1113,27 @@ class Trainer1D(object):
                 self.step += 1
                 if accelerator.is_main_process:
                     self.ema.update()
+                    
+                    # Log metrics to CSV
+                    current_lr = self.opt.param_groups[0]['lr']
+                    elapsed_time = time.time() - self.start_time
+                    
+                    # We'll update val_loss when we evaluate
+                    metrics_row = {
+                        'step': self.step,
+                        'loss': total_loss,
+                        'loss_denoise': loss_denoise.item() if torch.is_tensor(loss_denoise) else loss_denoise,
+                        'loss_energy': loss_energy.item() if torch.is_tensor(loss_energy) else loss_energy,
+                        'loss_opt': loss_opt.item() if torch.is_tensor(loss_opt) else loss_opt,
+                        'val_loss': None,  # Will be updated during evaluation
+                        'lr': current_lr,
+                        'time': elapsed_time
+                    }
+                    self.metrics_data.append(metrics_row)
+                    
+                    # Write to CSV periodically
+                    if self.step % 100 == 0 or self.step == self.train_num_steps:
+                        self._write_metrics_to_csv()
 
                     # if True:
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
@@ -1032,18 +1142,38 @@ class Trainer1D(object):
                         self.save(milestone)
 
                         if self.latent:
-                            self.evaluate(device, milestone, inp=inp, label=label_gt, mask=mask_latent)
+                            val_loss = self.evaluate(device, milestone, inp=inp, label=label_gt, mask=mask_latent)
                         else:
-                            self.evaluate(device, milestone, inp=inp, label=label, mask=mask)
+                            val_loss = self.evaluate(device, milestone, inp=inp, label=label, mask=mask)
+                        
+                        # Update the last metrics row with validation loss
+                        if val_loss is not None and len(self.metrics_data) > 0:
+                            self.metrics_data[-1]['val_loss'] = val_loss
+                            self._write_metrics_to_csv()
 
 
                 pbar.update(1)
 
         accelerator.print('training complete')
+        
+        # Write final metrics
+        if accelerator.is_main_process:
+            self._write_metrics_to_csv()
+    
+    def _write_metrics_to_csv(self):
+        """Write accumulated metrics to CSV file"""
+        if len(self.metrics_data) == 0:
+            return
+            
+        with open(self.metrics_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['step', 'loss', 'loss_denoise', 'loss_energy', 'loss_opt', 'val_loss', 'lr', 'time'])
+            writer.writeheader()
+            writer.writerows(self.metrics_data)
 
     def evaluate(self, device, milestone, inp=None, label=None, mask=None):
         print('Running Evaluation...')
         self.ema.ema_model.eval()
+        val_loss = None
 
         if inp is not None and label is not None:
             with torch.no_grad():
@@ -1063,6 +1193,7 @@ class Trainer1D(object):
                 if self.metric == 'mse':
                     all_samples = torch.cat(all_samples_list, dim = 0)
                     mse_error = (all_samples - label).pow(2).mean()
+                    val_loss = mse_error.item()
                     rows = [('mse_error', mse_error)]
                     print(tabulate(rows))
                 elif self.metric == 'bce':
@@ -1102,11 +1233,15 @@ class Trainer1D(object):
                     raise NotImplementedError()
 
         if self.validation_dl is not None:
-            self._run_validation(self.validation_dl, device, milestone, prefix = 'Validation')
+            val_loss_from_validation = self._run_validation(self.validation_dl, device, milestone, prefix = 'Validation')
+            if val_loss_from_validation is not None:
+                val_loss = val_loss_from_validation
 
         if (self.step % (self.save_and_sample_every * self.extra_validation_every_mul) == 0 and self.extra_validation_dls is not None) or self.evaluate_first:
             for key, extra_dl in self.extra_validation_dls.items():
                 self._run_validation(extra_dl, device, milestone, prefix = key)
+        
+        return val_loss
 
     def _run_validation(self, dl, device, milestone, prefix='Validation'):
         meters = collections.defaultdict(AverageMeter)
@@ -1184,6 +1319,13 @@ class Trainer1D(object):
             rows = [[k, v.avg] for k, v in meters.items()]
             print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (ID: {prefix})')
             print(tabulate(rows))
+            
+            # Return validation loss if available
+            if 'mse' in meters:
+                return meters['mse'].avg
+            elif 'accuracy' in meters:
+                return 1.0 - meters['accuracy'].avg  # Convert accuracy to loss
+            return None
 
 
 as_float = lambda x: float(x.item())
