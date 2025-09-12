@@ -145,7 +145,7 @@ def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps
     beta_start = scale * 0.0001
     beta_end = scale * 0.02
-    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
+    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float32)
 
 def cosine_beta_schedule(timesteps, s = 0.008):
     """
@@ -153,7 +153,7 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
     """
     steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps, dtype = torch.float64)
+    x = torch.linspace(0, timesteps, steps, dtype = torch.float32)
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
@@ -748,9 +748,9 @@ class GaussianDiffusion1D(nn.Module):
                         # expand (no physical copy) then reshape to [B*M_local,...]
                         inp_bm = inp.unsqueeze(1).expand(B_local, M_local, *inp.shape[1:]).reshape(B_local * M_local, *inp.shape[1:])
                         t_bm = t.view(B_local, 1).expand(B_local, M_local).reshape(B_local * M_local)
-                        # Fix: flatten all dimensions after B*M to avoid shape mismatch
-                        xn_flat = xn.reshape(B_local * M_local, -1)
-                        e_raw = self.model(inp_bm, xn_flat, t_bm, return_energy=True)
+                        # Reshape xn to match expected model input shape
+                        xn_reshaped = xn.reshape(B_local * M_local, *xn.shape[2:])
+                        e_raw = self.model(inp_bm, xn_reshaped, t_bm, return_energy=True)
                         e = e_raw if e_raw.dim() == 1 else e_raw.view(B_local * M_local, -1).mean(dim=1)
                         return e.view(B_local, M_local)  # [B, M_local]
                     
