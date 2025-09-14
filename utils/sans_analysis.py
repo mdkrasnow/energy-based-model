@@ -347,16 +347,16 @@ def plot_sans_diagnostics(sans_df: pd.DataFrame, save_path: Optional[str] = None
     
     if 'weight_energy_corr' in sans_df.columns:
         mean_corr = sans_df['weight_energy_corr'].mean()
-        summary_text += f"Mean Correlation: {mean_corr:.3f}\n"
-        summary_text += f"Negative Corr %: {(sans_df['weight_energy_corr'] < 0).mean()*100:.1f}%\n"
+        summary_text += f"Mean Correlation: {mean_corr}\n"
+        summary_text += f"Negative Corr %: {(sans_df['weight_energy_corr'] < 0).mean()*100}%\n"
     
     if 'entropy_ratio' in sans_df.columns:
         mean_entropy = sans_df['entropy_ratio'].mean()
-        summary_text += f"Mean Entropy Ratio: {mean_entropy:.3f}\n"
+        summary_text += f"Mean Entropy Ratio: {mean_entropy}\n"
     
     if 'real_energy_mean' in sans_df.columns and 'neg_energy_mean' in sans_df.columns:
         mean_sep = (sans_df['neg_energy_mean'] - sans_df['real_energy_mean']).mean()
-        summary_text += f"Mean Energy Sep: {mean_sep:.3f}\n"
+        summary_text += f"Mean Energy Sep: {mean_sep}\n"
     
     if 'num_negatives' in sans_df.columns:
         summary_text += f"Num Negatives: {sans_df['num_negatives'].iloc[0]}\n"
@@ -430,9 +430,9 @@ def generate_hyperparameter_report(experiments: Dict[str, str], save_path: Optio
         report.append("BEST CONFIGURATION (by final loss):")
         report.append("-"*40)
         report.append(f"Experiment: {best_config.get('experiment', 'N/A')}")
-        report.append(f"Final Loss: {best_config.get('final_loss', 'N/A'):.6f}")
-        report.append(f"Mean Correlation: {best_config.get('corr_mean_correlation', 'N/A'):.3f}")
-        report.append(f"Mean Entropy Ratio: {best_config.get('entropy_mean_entropy_ratio', 'N/A'):.3f}")
+        report.append(f"Final Loss: {best_config.get('final_loss', 'N/A')}")
+        report.append(f"Mean Correlation: {best_config.get('corr_mean_correlation', 'N/A')}")
+        report.append(f"Mean Entropy Ratio: {best_config.get('entropy_mean_entropy_ratio', 'N/A')}")
         report.append("")
     
     # Configuration comparison table

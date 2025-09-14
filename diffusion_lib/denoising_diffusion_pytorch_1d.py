@@ -852,7 +852,7 @@ class GaussianDiffusion1D(nn.Module):
                             print(f"  Weight shape: {w.shape}, requires_grad={w.requires_grad}")
                             print(f"  Corr(weight, energy): {corr:.4f} (should be negative)")
                             print(f"  Weight entropy: {entropy:.4f} (max={max_entropy:.4f}, ratio={entropy/max_entropy:.2f})")
-                            print(f"  Alpha (temp): {alpha_eff_val:.4f}, t_mean={t.float().mean():.1f}")
+                            print(f"  Alpha (temp): {alpha_eff_val:.4f}, t_mean={t.float().mean()}")
                             print(f"  Loss components: denoise={loss_mse.mean():.4f}, energy={loss_energy.mean():.4f}, opt={loss_opt.mean():.4f}")
             
             if not self.sans_enabled:
@@ -1173,7 +1173,7 @@ class Trainer1D(object):
                     
                     # Log metrics collection for debugging
                     if self.step <= 10 or self.step % 100 == 0:
-                        print(f"[DEBUG] Step {self.step}: Collected metrics - Loss: {total_loss:.6f}")
+                        print(f"[DEBUG] Step {self.step}: Collected metrics - Loss: {total_loss}")
                     
                     # Collect SANS debugging metrics if available
                     if self.sans_debug_enabled and hasattr(self.model, 'last_sans_metrics') and self.model.last_sans_metrics is not None:
