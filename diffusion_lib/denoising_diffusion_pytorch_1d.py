@@ -936,7 +936,8 @@ class Trainer1D(object):
         extra_validation_every_mul = 10,
         evaluate_first = False,
         latent = False,
-        autoencode_model = None
+        autoencode_model = None,
+        sans_debug = False
     ):
         super().__init__()
 
@@ -1042,7 +1043,11 @@ class Trainer1D(object):
         # Initialize SANS debugging metrics if enabled
         self.sans_debug_file = self.results_folder / 'sans_debug.csv'
         self.sans_debug_data = []
-        self.sans_debug_enabled = hasattr(diffusion_model, 'sans_enabled') and diffusion_model.sans_enabled
+        # Enable SANS debugging if explicitly requested OR if SANS is enabled in the model
+        self.sans_debug_enabled = sans_debug or (hasattr(diffusion_model, 'sans_enabled') and diffusion_model.sans_enabled)
+        
+        if self.sans_debug_enabled:
+            print(f"SANS debugging enabled - metrics will be saved to {self.sans_debug_file}")
 
     @property
     def device(self):
@@ -1166,6 +1171,10 @@ class Trainer1D(object):
                     }
                     self.metrics_data.append(metrics_row)
                     
+                    # Log metrics collection for debugging
+                    if self.step <= 10 or self.step % 100 == 0:
+                        print(f"[DEBUG] Step {self.step}: Collected metrics - Loss: {total_loss:.6f}")
+                    
                     # Collect SANS debugging metrics if available
                     if self.sans_debug_enabled and hasattr(self.model, 'last_sans_metrics') and self.model.last_sans_metrics is not None:
                         sans_row = {
@@ -1207,8 +1216,10 @@ class Trainer1D(object):
     def _write_metrics_to_csv(self):
         """Write accumulated metrics to CSV file"""
         if len(self.metrics_data) == 0:
+            print(f"[DEBUG] No metrics data to write at step {self.step}")
             return
             
+        print(f"[DEBUG] Writing {len(self.metrics_data)} metrics rows to {self.metrics_file}")
         with open(self.metrics_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['step', 'loss', 'loss_denoise', 'loss_energy', 'loss_opt', 'val_loss', 'lr', 'time'])
             writer.writeheader()
@@ -1216,11 +1227,14 @@ class Trainer1D(object):
         
         # Write SANS debugging metrics if available
         if self.sans_debug_enabled and len(self.sans_debug_data) > 0:
+            print(f"[DEBUG] Writing {len(self.sans_debug_data)} SANS debug rows to {self.sans_debug_file}")
             with open(self.sans_debug_file, 'w', newline='') as f:
                 fieldnames = list(self.sans_debug_data[0].keys())
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(self.sans_debug_data)
+        elif self.sans_debug_enabled:
+            print(f"[DEBUG] SANS debug enabled but no data collected yet at step {self.step}")
 
     def evaluate(self, device, milestone, inp=None, label=None, mask=None):
         print('Running Evaluation...')

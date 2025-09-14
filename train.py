@@ -298,9 +298,14 @@ if __name__ == "__main__":
         **kwargs
     )
 
-    result_dir = osp.join('results', f'ds_{FLAGS.dataset}', f'model_{FLAGS.model}')
-    if FLAGS.diffusion_steps != 100:
-        result_dir = result_dir + f'_diffsteps_{FLAGS.diffusion_steps}'
+    # Check if RESULTS_FOLDER environment variable is set (used by notebook experiments)
+    if 'RESULTS_FOLDER' in os.environ:
+        result_dir = os.environ['RESULTS_FOLDER']
+        print(f"Using results directory from environment: {result_dir}")
+    else:
+        result_dir = osp.join('results', f'ds_{FLAGS.dataset}', f'model_{FLAGS.model}')
+        if FLAGS.diffusion_steps != 100:
+            result_dir = result_dir + f'_diffsteps_{FLAGS.diffusion_steps}'
     os.makedirs(result_dir, exist_ok=True)
     
     # Export configuration if requested
@@ -345,7 +350,8 @@ if __name__ == "__main__":
         save_and_sample_every = save_and_sample_every,
         evaluate_first = FLAGS.evaluate,  # run one evaluation first
         latent = FLAGS.latent,  # whether we are doing reasoning in the latent space
-        autoencode_model = autoencode_model
+        autoencode_model = autoencode_model,
+        sans_debug = FLAGS.sans_debug  # Pass SANS debug flag to trainer
     )
 
     if FLAGS.load_milestone is not None:
