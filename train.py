@@ -67,7 +67,7 @@ parser.add_argument('--sans-temp-schedule', type=str2bool, default=True,
                     help='linearly decay α with timestep t (on by default)')
 parser.add_argument('--sans-chunk', type=int, default=0,
                     help='optional chunk size over negatives to bound memory; 0 = auto')
-parser.add_argument('--sans-debug', type=str2bool, default=True,
+parser.add_argument('--sans-debug', action='store_true',
                     help='enable detailed SANS debugging output to sans_debug.csv')
 parser.add_argument('--export-config', type=str, default=None,
                     help='export full configuration to JSON file')
