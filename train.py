@@ -59,14 +59,18 @@ parser.add_argument('--metrics-file', type=str, default=None, help='Path to save
 # --- SANS (Self-Adversarial Negative Sampling) ---
 parser.add_argument('--sans', type=str2bool, default=False,
                     help='enable self-adversarial negative sampling (RotatE-style weights over mined negatives)')
-parser.add_argument('--sans-num-negs', type=int, default=16,
+parser.add_argument('--sans-num-negs', type=int, default=32,
                     help='number of candidate negatives per item (M) - increased from 4 to 16 for better SANS performance')
-parser.add_argument('--sans-temp', type=float, default=2.0,
+parser.add_argument('--sans-temp', type=float, default=0.5,
                     help='adversarial temperature α (RotatE typically uses ~1.0)')
 parser.add_argument('--sans-temp-schedule', type=str2bool, default=True,
                     help='linearly decay α with timestep t (on by default)')
 parser.add_argument('--sans-chunk', type=int, default=0,
                     help='optional chunk size over negatives to bound memory; 0 = auto')
+parser.add_argument('--sans-debug', type=str2bool, default=True,
+                    help='enable detailed SANS debugging output to sans_debug.csv')
+parser.add_argument('--export-config', type=str, default=None,
+                    help='export full configuration to JSON file')
 
 
 if __name__ == "__main__":
@@ -298,6 +302,16 @@ if __name__ == "__main__":
     if FLAGS.diffusion_steps != 100:
         result_dir = result_dir + f'_diffsteps_{FLAGS.diffusion_steps}'
     os.makedirs(result_dir, exist_ok=True)
+    
+    # Export configuration if requested
+    if FLAGS.export_config:
+        import json
+        config_path = osp.join(result_dir, FLAGS.export_config if FLAGS.export_config.endswith('.json') else f'{FLAGS.export_config}.json')
+        config_dict = vars(FLAGS)
+        config_dict['result_dir'] = result_dir
+        with open(config_path, 'w') as f:
+            json.dump(config_dict, f, indent=2)
+        print(f"Configuration exported to {config_path}")
 
     if FLAGS.latent:
         # Load the decoder

@@ -181,8 +181,8 @@ class GaussianDiffusion1D(nn.Module):
         connectivity = False,
         shortest_path = False,
         sans_enabled = False,
-        sans_num_negs = 4,
-        sans_temp = 2.0,
+        sans_num_negs = 32,
+        sans_temp = 0.5,
         sans_temp_schedule = True,
         sans_chunk = 0,
     ):
@@ -289,6 +289,9 @@ class GaussianDiffusion1D(nn.Module):
 
         register_buffer('loss_weight', loss_weight)
         # whether to autonormalize
+        
+        # Initialize SANS metrics tracking
+        self.last_sans_metrics = None
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
@@ -797,35 +800,58 @@ class GaussianDiffusion1D(nn.Module):
                     loss_scale = 0.5  # default loss scale
                     
                     # DEBUG: SANS instrumentation
-                    if torch.rand(1).item() < 0.01:  # Log 1% of the time randomly
-                        with torch.no_grad():
-                            # Negative distance stats
-                            neg_distance = energy_negs  # [B,M] - lower is harder
+                    # Always collect metrics for tracking
+                    with torch.no_grad():
+                        # Negative distance stats
+                        neg_distance = energy_negs  # [B,M] - lower is harder
+                        
+                        # Weight sanity check
+                        w_sum = w.sum(dim=-1)
+                        
+                        # Correlation between weights and hardness
+                        # For energy (lower=harder), correlation should be negative
+                        w_flat = w.flatten()
+                        e_flat = energy_negs.flatten()
+                        corr = torch.tensor(0.0)
+                        if len(w_flat) > 1:
+                            corr = torch.corrcoef(torch.stack([w_flat, e_flat]))[0, 1]
+                        
+                        # Weight entropy
+                        entropy = -(w * torch.log(w + 1e-10)).sum(dim=-1).mean()
+                        max_entropy = torch.log(torch.tensor(M, dtype=torch.float32))
+                        
+                        # Temperature schedule
+                        alpha_eff_val = alpha_eff.mean()
+                        
+                        # Store metrics for export (will be picked up by trainer)
+                        self.last_sans_metrics = {
+                            'neg_energy_mean': neg_distance.mean().item(),
+                            'neg_energy_min': neg_distance.min().item(),
+                            'neg_energy_max': neg_distance.max().item(),
+                            'neg_energy_std': neg_distance.std().item(),
+                            'real_energy_mean': energy_real.mean().item(),
+                            'real_energy_min': energy_real.min().item(),
+                            'real_energy_max': energy_real.max().item(),
+                            'weight_energy_corr': corr.item(),
+                            'weight_entropy': entropy.item(),
+                            'max_entropy': max_entropy.item(),
+                            'entropy_ratio': (entropy/max_entropy).item(),
+                            'alpha_effective': alpha_eff_val.item(),
+                            't_mean': t.float().mean().item(),
+                            'num_negatives': M,
+                            'batch_size': B
+                        }
+                        
+                        # Print debug info occasionally
+                        if torch.rand(1).item() < 0.01:  # Log 1% of the time randomly
                             print(f"\n[SANS Debug]")
                             print(f"  Neg energy: mean={neg_distance.mean():.4f}, min={neg_distance.min():.4f}, max={neg_distance.max():.4f}, std={neg_distance.std():.4f}")
                             print(f"  Real energy: mean={energy_real.mean():.4f}, min={energy_real.min():.4f}, max={energy_real.max():.4f}")
                             print(f"  K={M}, B={B}")
-                            
-                            # Weight sanity check
-                            w_sum = w.sum(dim=-1)
                             print(f"  Weight sum: mean={w_sum.mean():.4f}, min={w_sum.min():.4f}, max={w_sum.max():.4f} (should be 1.0)")
                             print(f"  Weight shape: {w.shape}, requires_grad={w.requires_grad}")
-                            
-                            # Correlation between weights and hardness
-                            # For energy (lower=harder), correlation should be negative
-                            w_flat = w.flatten()
-                            e_flat = energy_negs.flatten()
-                            if len(w_flat) > 1:
-                                corr = torch.corrcoef(torch.stack([w_flat, e_flat]))[0, 1]
-                                print(f"  Corr(weight, energy): {corr:.4f} (should be negative)")
-                            
-                            # Weight entropy
-                            entropy = -(w * torch.log(w + 1e-10)).sum(dim=-1).mean()
-                            max_entropy = torch.log(torch.tensor(M, dtype=torch.float32))
+                            print(f"  Corr(weight, energy): {corr:.4f} (should be negative)")
                             print(f"  Weight entropy: {entropy:.4f} (max={max_entropy:.4f}, ratio={entropy/max_entropy:.2f})")
-                            
-                            # Temperature schedule
-                            alpha_eff_val = alpha_eff.mean()
                             print(f"  Alpha (temp): {alpha_eff_val:.4f}, t_mean={t.float().mean():.1f}")
                             print(f"  Loss components: denoise={loss_mse.mean():.4f}, energy={loss_energy.mean():.4f}, opt={loss_opt.mean():.4f}")
             
@@ -1012,6 +1038,11 @@ class Trainer1D(object):
         self.metrics_file = self.results_folder / 'metrics.csv'
         self.metrics_data = []
         self.start_time = None
+        
+        # Initialize SANS debugging metrics if enabled
+        self.sans_debug_file = self.results_folder / 'sans_debug.csv'
+        self.sans_debug_data = []
+        self.sans_debug_enabled = hasattr(diffusion_model, 'sans_enabled') and diffusion_model.sans_enabled
 
     @property
     def device(self):
@@ -1135,6 +1166,15 @@ class Trainer1D(object):
                     }
                     self.metrics_data.append(metrics_row)
                     
+                    # Collect SANS debugging metrics if available
+                    if self.sans_debug_enabled and hasattr(self.model, 'last_sans_metrics') and self.model.last_sans_metrics is not None:
+                        sans_row = {
+                            'step': self.step,
+                            'time': elapsed_time,
+                            **self.model.last_sans_metrics
+                        }
+                        self.sans_debug_data.append(sans_row)
+                    
                     # Write to CSV periodically
                     if self.step % 100 == 0 or self.step == self.train_num_steps:
                         self._write_metrics_to_csv()
@@ -1173,6 +1213,14 @@ class Trainer1D(object):
             writer = csv.DictWriter(f, fieldnames=['step', 'loss', 'loss_denoise', 'loss_energy', 'loss_opt', 'val_loss', 'lr', 'time'])
             writer.writeheader()
             writer.writerows(self.metrics_data)
+        
+        # Write SANS debugging metrics if available
+        if self.sans_debug_enabled and len(self.sans_debug_data) > 0:
+            with open(self.sans_debug_file, 'w', newline='') as f:
+                fieldnames = list(self.sans_debug_data[0].keys())
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.sans_debug_data)
 
     def evaluate(self, device, milestone, inp=None, label=None, mask=None):
         print('Running Evaluation...')
