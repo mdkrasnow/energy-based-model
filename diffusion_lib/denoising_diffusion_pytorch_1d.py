@@ -707,80 +707,13 @@ class GaussianDiffusion1D(nn.Module):
             if mask is not None:
                 data_cond = self.q_sample(x_start = x_start, t = t, noise = torch.zeros_like(noise))
                 data_sample = data_sample * (1 - mask) + mask * data_cond
-
-            # Add a noise contrastive estimation term with samples drawn from the data distribution
-            #noise = torch.randn_like(x_start)
-
-            # Optimize a sample using gradient descent on energy landscape
-            xmin_noise = self.q_sample(x_start = x_start, t = t, noise = 3.0 * noise)
-
-            if mask is not None:
-                xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
             else:
                 data_cond = None
 
-            if self.sudoku:
-                s = x_start.size()
-                x_start_im = x_start.view(-1, 9, 9, 9).argmax(dim=-1)
-                randperm = torch.randint(0, 9, x_start_im.size(), device=x_start_im.device)
-
-                rand_mask = (torch.rand(x_start_im.size(), device=x_start_im.device) < 0.05).float()
-
-                xmin_noise_im = x_start_im * (1 - rand_mask) + randperm * (rand_mask)
-
-                xmin_noise_im = F.one_hot(xmin_noise_im.long(), num_classes=9)
-                xmin_noise_im = (xmin_noise_im - 0.5) * 2
-
-                xmin_noise_rescale = xmin_noise_im.view(-1, 729)
-
-                loss_opt = torch.ones(1)
-
-                loss_scale = 0.05
-            elif self.connectivity:
-                s = x_start.size()
-                x_start_im = x_start.view(-1, 12, 12)
-                randperm = (torch.randint(0, 1, x_start_im.size(), device=x_start_im.device) - 0.5) * 2
-
-                rand_mask = (torch.rand(x_start_im.size(), device=x_start_im.device) < 0.05).float()
-
-                xmin_noise_rescale = x_start_im * (1 - rand_mask) + randperm * (rand_mask)
-
-                loss_opt = torch.ones(1)
-
-                loss_scale = 0.05
-            elif self.shortest_path:
-                x_start_list = x_start.argmax(dim=2)
-                classes = x_start.size(2)
-                rand_vals = torch.randint(0, classes, x_start_list.size()).to(x_start.device)
-
-                x_start_neg = torch.cat([rand_vals[:, :1], x_start_list[:, 1:]], dim=1)
-                x_start_neg_oh = F.one_hot(x_start_neg[:, :, 0].long(), num_classes=classes)[:, :, :, None]
-                xmin_noise_rescale = (x_start_neg_oh - 0.5) * 2
-
-                loss_opt = torch.ones(1)
-
-                loss_scale = 0.5
-            else:
-
-                xmin_noise = self.opt_step(inp, xmin_noise, t, mask, data_cond, step=2, sf=1.0)
-                xmin = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-                loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
-
-                xmin_noise = xmin_noise.detach()
-                xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, t, torch.zeros_like(xmin_noise))
-                xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
-
-                # loss_opt = torch.ones(1)
-
-
-                # rand_mask = (torch.rand(x_start.size(), device=x_start.device) < 0.2).float()
-
-                # xmin_noise_rescale =  x_start * (1 - rand_mask) + rand_mask * x_start_noise
-
-                # nrep = 1
-
-
-                loss_scale = 0.5
+            # Enhanced adversarial corruption replaces all task-specific corruption logic
+            xmin_noise_rescale = self.enhanced_corruption_step(inp, x_start, t, mask, data_cond)
+            loss_opt = torch.ones(1)
+            loss_scale = 0.5
 
             xmin_noise = self.q_sample(x_start=xmin_noise_rescale, t=t, noise=noise)
 
@@ -799,6 +732,13 @@ class GaussianDiffusion1D(nn.Module):
             energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
             target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
             loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+
+            # Track energy landscape quality for adaptive curriculum
+            with torch.no_grad():
+                energy_diff = (energy_fake - energy_real).mean().item()
+                self.recent_energy_diffs.append(max(0, energy_diff))
+                if len(self.recent_energy_diffs) > 100:
+                    self.recent_energy_diffs.pop(0)
 
             # loss_energy = energy_real.mean() - energy_fake.mean()# loss_energy.mean()
 

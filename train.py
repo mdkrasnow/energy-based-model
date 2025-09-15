@@ -54,6 +54,15 @@ parser.add_argument('--latent', action='store_true', default=False)
 parser.add_argument('--ood', action='store_true', default=False)
 parser.add_argument('--baseline', action='store_true', default=False)
 
+# Adversarial Negative Mining arguments
+parser.add_argument('--use-adversarial-corruption', type=str2bool, default=False,
+                   help='Use adversarial corruption for enhanced negative mining')
+parser.add_argument('--anm-warmup-steps', type=int, default=5000,
+                   help='Steps before adversarial corruption begins')
+parser.add_argument('--anm-adversarial-steps', type=int, default=3,
+                   help='Number of adversarial optimization steps')
+parser.add_argument('--anm-distance-penalty', type=float, default=0.1,
+                   help='Weight for distance penalty in adversarial loss')
 
 if __name__ == "__main__":
     FLAGS = parser.parse_args()
@@ -271,6 +280,10 @@ if __name__ == "__main__":
         supervise_energy_landscape = FLAGS.supervise_energy_landscape,
         use_innerloop_opt = FLAGS.use_innerloop_opt,
         show_inference_tqdm = False,
+        use_adversarial_corruption = FLAGS.use_adversarial_corruption,
+        anm_warmup_steps = FLAGS.anm_warmup_steps,
+        anm_adversarial_steps = FLAGS.anm_adversarial_steps,
+        anm_distance_penalty = FLAGS.anm_distance_penalty,
         **kwargs
     )
 
