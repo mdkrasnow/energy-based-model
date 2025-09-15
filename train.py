@@ -8,13 +8,21 @@ os.environ['MKL_NUM_THREADS'] = '1'
 
 from diffusion_lib.denoising_diffusion_pytorch_1d import GaussianDiffusion1D, Trainer1D
 from models import EBM, DiffusionWrapper
-from models import SudokuEBM, SudokuTransformerEBM, SudokuDenoise, SudokuLatentEBM, AutoencodeModel
+from models import SudokuEBM, SudokuDenoise, SudokuLatentEBM, AutoencodeModel
 from models import GraphEBM, GraphReverse, GNNConvEBM, GNNDiffusionWrapper, GNNConvDiffusionWrapper, GNNConv1DEBMV2, GNNConv1DV2DiffusionWrapper, GNNConv1DReverse
 from dataset import Addition, LowRankDataset, Inverse
 from reasoning_dataset import FamilyTreeDataset, GraphConnectivityDataset, FamilyDatasetWrapper, GraphDatasetWrapper
 from planning_dataset import PlanningDataset, PlanningDatasetOnline
 from sat_dataset import SATNetDataset, SudokuDataset, SudokuRRNDataset, SudokuRRNLatentDataset
 import torch
+
+# Import curriculum configuration with error handling
+try:
+    from curriculum_config import get_curriculum_by_name, DEFAULT_CURRICULUM
+    CURRICULUM_AVAILABLE = True
+except ImportError:
+    print("Warning: curriculum_config module not found. Curriculum features disabled.")
+    CURRICULUM_AVAILABLE = False
 
 import argparse
 
@@ -40,7 +48,7 @@ parser = argparse.ArgumentParser(description='Train Diffusion Reasoning Model')
 
 parser.add_argument('--dataset', default='inverse', type=str, help='dataset to evaluate')
 parser.add_argument('--inspect-dataset', action='store_true', help='run an IPython embed interface after loading the dataset')
-parser.add_argument('--model', default='mlp', type=str, choices=['mlp', 'mlp-reverse', 'sudoku', 'sudoku-latent', 'sudoku-transformer', 'sudoku-reverse', 'gnn', 'gnn-reverse', 'gnn-conv', 'gnn-conv-1d', 'gnn-conv-1d-v2', 'gnn-conv-1d-v2-reverse'])
+parser.add_argument('--model', default='mlp', type=str, choices=['mlp', 'mlp-reverse', 'sudoku', 'sudoku-latent', 'sudoku-reverse', 'gnn', 'gnn-reverse', 'gnn-conv', 'gnn-conv-1d', 'gnn-conv-1d-v2', 'gnn-conv-1d-v2-reverse'])
 parser.add_argument('--load-milestone', type=str, default=None, help='load a model from a milestone')
 parser.add_argument('--batch_size', default=2048, type=int, help='size of batch of input to use')
 parser.add_argument('--diffusion_steps', default=10, type=int, help='number of diffusion time steps (default: 10)')
@@ -53,7 +61,32 @@ parser.add_argument('--evaluate', action='store_true', default=False)
 parser.add_argument('--latent', action='store_true', default=False)
 parser.add_argument('--ood', action='store_true', default=False)
 parser.add_argument('--baseline', action='store_true', default=False)
+# CSV logging arguments
+parser.add_argument('--save-csv-logs', action='store_true', default=False,
+                   help='Save training and validation metrics to CSV files')
+parser.add_argument('--csv-log-interval', type=int, default=100,
+                   help='Interval for logging training metrics to CSV')
+parser.add_argument('--csv-log-dir', type=str, default='./csv_logs',
+                   help='Directory to save CSV log files')
 
+# Adversarial Negative Mining arguments
+parser.add_argument('--use-adversarial-corruption', type=str2bool, default=False,
+                   help='Use adversarial corruption for enhanced negative mining')
+parser.add_argument('--anm-warmup-steps', type=int, default=5000,
+                   help='Steps before adversarial corruption begins')
+parser.add_argument('--anm-adversarial-steps', type=int, default=3,
+                   help='Number of adversarial optimization steps')
+parser.add_argument('--anm-distance-penalty', type=float, default=0.1,
+                   help='Weight for distance penalty in adversarial loss')
+parser.add_argument('--train-num-steps', type=int, default=1000,
+                   help='Total number of training steps')
+
+# Curriculum configuration arguments
+parser.add_argument('--curriculum-config', type=str, default='default',
+                   choices=['default', 'aggressive', 'conservative', 'none'],
+                   help='Choice of curriculum configuration (default: default)')
+parser.add_argument('--disable-curriculum', type=str2bool, default=False,
+                   help='Boolean to force legacy behavior (default: False)')
 
 if __name__ == "__main__":
     FLAGS = parser.parse_args()
@@ -70,8 +103,9 @@ if __name__ == "__main__":
         metric = 'mse'
     elif FLAGS.dataset == "inverse":
         dataset = Inverse("train", FLAGS.rank, FLAGS.ood)
-        validation_dataset = dataset
+        validation_dataset = Inverse("val", FLAGS.rank, FLAGS.ood)
         metric = 'mse'
+        save_and_sample_every = 100  # Lower interval for short training runs
     elif FLAGS.dataset == "lowrank":
         dataset = LowRankDataset("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = dataset
@@ -210,12 +244,6 @@ if __name__ == "__main__":
             out_dim = dataset.out_dim,
         )
         model = DiffusionWrapper(model)
-    elif FLAGS.model == 'sudoku-transformer':
-        model = SudokuTransformerEBM(
-            inp_dim = dataset.inp_dim,
-            out_dim = dataset.out_dim,
-        )
-        model = DiffusionWrapper(model)
     elif FLAGS.model == 'sudoku-reverse':
         model = SudokuDenoise(
             inp_dim = dataset.inp_dim,
@@ -262,6 +290,33 @@ if __name__ == "__main__":
     if FLAGS.dataset in ['shortest-path', 'shortest-path-1d']:
         kwargs['shortest_path'] = True
 
+    # Configure curriculum
+    curriculum_config = None
+    if CURRICULUM_AVAILABLE and not FLAGS.disable_curriculum and FLAGS.curriculum_config != 'none':
+        try:
+            curriculum_config = get_curriculum_by_name(FLAGS.curriculum_config)
+            # Update curriculum with actual training steps
+            curriculum_config.total_steps = FLAGS.train_num_steps
+            print(f"Using curriculum: {FLAGS.curriculum_config}")
+            print(f"Curriculum stages: {len(curriculum_config.stages)}")
+            for (start_pct, end_pct), stage in curriculum_config.stages.items():
+                start_step = int(start_pct * FLAGS.train_num_steps)
+                end_step = int(end_pct * FLAGS.train_num_steps)
+                print(f"  {stage.name}: steps {start_step}-{end_step} ({stage.focus})")
+        except Exception as e:
+            print(f"Warning: Failed to load curriculum '{FLAGS.curriculum_config}': {e}")
+            print("Falling back to legacy behavior")
+            curriculum_config = None
+    else:
+        if FLAGS.disable_curriculum:
+            print("Curriculum disabled by --disable-curriculum flag")
+        elif FLAGS.curriculum_config == 'none':
+            print("Curriculum disabled by --curriculum-config=none")
+        elif not CURRICULUM_AVAILABLE:
+            print("Curriculum not available (curriculum_config module not found)")
+        else:
+            print("Using legacy training behavior")
+
     diffusion = GaussianDiffusion1D(
         model,
         seq_length = 32,
@@ -271,6 +326,12 @@ if __name__ == "__main__":
         supervise_energy_landscape = FLAGS.supervise_energy_landscape,
         use_innerloop_opt = FLAGS.use_innerloop_opt,
         show_inference_tqdm = False,
+        use_adversarial_corruption = FLAGS.use_adversarial_corruption,
+        anm_warmup_steps = FLAGS.anm_warmup_steps,
+        anm_adversarial_steps = FLAGS.anm_adversarial_steps,
+        anm_distance_penalty = FLAGS.anm_distance_penalty,
+        curriculum_config = curriculum_config,
+        disable_curriculum = FLAGS.disable_curriculum or FLAGS.curriculum_config == 'none',
         **kwargs
     )
 
@@ -288,13 +349,15 @@ if __name__ == "__main__":
     else:
         autoencode_model = None
 
+
     trainer = Trainer1D(
         diffusion,
         dataset,
+        dataset_name = FLAGS.dataset,  # Pass dataset name for accuracy computation
         train_batch_size = FLAGS.batch_size,
         validation_batch_size = validation_batch_size,
         train_lr = 1e-4,
-        train_num_steps = 1300000,         # total training steps
+        train_num_steps = FLAGS.train_num_steps,         # total training steps
         gradient_accumulate_every = 1,    # gradient accumulation steps
         ema_decay = 0.995,                # exponential moving average decay
         data_workers = FLAGS.data_workers,
@@ -308,7 +371,10 @@ if __name__ == "__main__":
         save_and_sample_every = save_and_sample_every,
         evaluate_first = FLAGS.evaluate,  # run one evaluation first
         latent = FLAGS.latent,  # whether we are doing reasoning in the latent space
-        autoencode_model = autoencode_model
+        autoencode_model = autoencode_model,
+        save_csv_logs = FLAGS.save_csv_logs,
+        csv_log_interval = FLAGS.csv_log_interval,
+        csv_log_dir = FLAGS.csv_log_dir
     )
 
     if FLAGS.load_milestone is not None:

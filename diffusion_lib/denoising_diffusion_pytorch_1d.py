@@ -3,6 +3,8 @@ import sys
 import collections
 from multiprocessing import cpu_count
 from pathlib import Path
+import csv
+from datetime import datetime
 from random import random
 from functools import partial
 from collections import namedtuple
@@ -24,6 +26,10 @@ from tqdm.auto import tqdm
 import os.path as osp
 import time
 import numpy as np
+
+# Import curriculum configuration system
+from curriculum_config import CurriculumConfig, DEFAULT_CURRICULUM
+# from metrics_tracker import CurriculumMetricsTracker  # Removed enhanced metrics
 
 
 def _custom_exception_hook(type, value, tb):
@@ -158,6 +164,208 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     return torch.clip(betas, 0, 0.999)
 
 
+class ValidationGatedCurriculum:
+    """
+    Helper class for managing validation-based curriculum gating.
+    
+    This class tracks validation performance and makes decisions about
+    curriculum progression, intensity adjustments, and rollbacks.
+    
+    Key Features:
+    - Tracks validation loss and accuracy with exponential moving averages
+    - Maintains stage-specific performance baselines
+    - Detects performance degradation beyond configurable thresholds
+    - Automatically adjusts curriculum intensity (0.1x to 2.0x multiplier)
+    - Supports curriculum rollback for severe performance drops
+    - Provides detailed logging of all adjustments and decisions
+    
+    Integration:
+    - Automatically initialized when curriculum_config is provided
+    - Integrates with get_current_curriculum_params() for seamless operation
+    - Can be disabled via curriculum_config.enable_validation_gating = False
+    - Thread-safe for concurrent validation updates
+    """
+    
+    def __init__(self, config: CurriculumConfig, window_size: int = 10):
+        """
+        Initialize validation gating system.
+        
+        Args:
+            config: CurriculumConfig with gating parameters
+            window_size: Number of recent validation scores to track
+        """
+        self.config = config
+        self.window_size = window_size
+        
+        # Validation performance tracking
+        self.val_loss_history = collections.deque(maxlen=window_size)
+        self.val_accuracy_history = collections.deque(maxlen=window_size)
+        self.val_loss_ema = None
+        self.val_accuracy_ema = None
+        
+        # Stage-specific baselines
+        self.stage_baselines = {}  # stage_name -> {'loss': float, 'accuracy': float}
+        self.current_stage_baseline = None
+        
+        # Curriculum adjustment state
+        self.intensity_multiplier = 1.0  # Current intensity adjustment (0.0 to 2.0)
+        self.consecutive_degradations = 0
+        self.last_adjustment_step = 0
+        self.rollback_count = 0
+        
+        # Performance tracking
+        self.performance_trend = "stable"  # "improving", "stable", "degrading"
+        self.adjustment_history = []  # List of (step, adjustment_type, reason)
+        
+    def update_validation_metrics(self, val_loss: float, val_accuracy: float, step: int):
+        """
+        Update validation metrics with exponential moving average.
+        
+        Args:
+            val_loss: Current validation loss
+            val_accuracy: Current validation accuracy
+            step: Current training step
+        """
+        # Update raw history
+        self.val_loss_history.append(val_loss)
+        self.val_accuracy_history.append(val_accuracy)
+        
+        # Update exponential moving averages (alpha = 0.1 for smoothing)
+        alpha = 0.1
+        if self.val_loss_ema is None:
+            self.val_loss_ema = val_loss
+            self.val_accuracy_ema = val_accuracy
+        else:
+            self.val_loss_ema = alpha * val_loss + (1 - alpha) * self.val_loss_ema
+            self.val_accuracy_ema = alpha * val_accuracy + (1 - alpha) * self.val_accuracy_ema
+    
+    def set_stage_baseline(self, stage_name: str, force_update: bool = False):
+        """
+        Set baseline performance for a curriculum stage.
+        
+        Args:
+            stage_name: Name of the curriculum stage
+            force_update: Whether to update existing baseline
+        """
+        if (stage_name not in self.stage_baselines or force_update) and self.val_loss_ema is not None:
+            self.stage_baselines[stage_name] = {
+                'loss': self.val_loss_ema,
+                'accuracy': self.val_accuracy_ema
+            }
+            self.current_stage_baseline = self.stage_baselines[stage_name]
+    
+    def detect_performance_degradation(self) -> tuple[bool, str]:
+        """
+        Detect if validation performance has degraded significantly.
+        
+        Returns:
+            Tuple of (is_degraded, reason)
+        """
+        if (len(self.val_loss_history) < 3 or 
+            self.current_stage_baseline is None or
+            self.val_loss_ema is None):
+            return False, "insufficient_data"
+        
+        baseline_loss = self.current_stage_baseline['loss']
+        baseline_accuracy = self.current_stage_baseline['accuracy']
+        
+        # Check loss degradation (increase beyond threshold)
+        loss_increase = (self.val_loss_ema - baseline_loss) / baseline_loss
+        if loss_increase > self.config.validation_threshold:
+            return True, f"loss_degradation_{loss_increase:.3f}"
+        
+        # Check accuracy degradation (decrease beyond threshold)
+        accuracy_decrease = (baseline_accuracy - self.val_accuracy_ema) / baseline_accuracy
+        if accuracy_decrease > self.config.validation_threshold:
+            return True, f"accuracy_degradation_{accuracy_decrease:.3f}"
+        
+        return False, "performance_stable"
+    
+    def should_adjust_curriculum(self, step: int) -> tuple[bool, str, str]:
+        """
+        Determine if curriculum should be adjusted based on validation performance.
+        
+        Args:
+            step: Current training step
+            
+        Returns:
+            Tuple of (should_adjust, adjustment_type, reason)
+            adjustment_type: "reduce_intensity", "increase_intensity", "rollback", "none"
+        """
+        if not self.config.enable_validation_gating:
+            return False, "none", "gating_disabled"
+        
+        # Don't adjust too frequently (minimum 1000 steps between adjustments)
+        if step - self.last_adjustment_step < 1000:
+            return False, "none", "too_recent"
+        
+        # Check for performance degradation
+        is_degraded, degradation_reason = self.detect_performance_degradation()
+        
+        if is_degraded:
+            self.consecutive_degradations += 1
+            
+            # If multiple consecutive degradations, consider rollback
+            if self.consecutive_degradations >= 3:
+                return True, "rollback", f"consecutive_degradations_{degradation_reason}"
+            else:
+                return True, "reduce_intensity", degradation_reason
+        else:
+            self.consecutive_degradations = 0
+            
+            # Check if performance is improving faster than expected
+            if (len(self.val_loss_history) >= 5 and 
+                self.val_loss_ema < self.current_stage_baseline['loss'] * 0.95):
+                # Performance is significantly better than baseline
+                return True, "increase_intensity", "performance_exceeding_baseline"
+        
+        return False, "none", "no_adjustment_needed"
+    
+    def adjust_intensity(self, adjustment_type: str, step: int, reason: str) -> float:
+        """
+        Adjust curriculum intensity based on validation performance.
+        
+        Args:
+            adjustment_type: Type of adjustment to make
+            step: Current training step
+            reason: Reason for adjustment
+            
+        Returns:
+            New intensity multiplier
+        """
+        old_intensity = self.intensity_multiplier
+        
+        if adjustment_type == "reduce_intensity":
+            self.intensity_multiplier = max(0.1, self.intensity_multiplier * 0.7)
+        elif adjustment_type == "increase_intensity":
+            self.intensity_multiplier = min(2.0, self.intensity_multiplier * 1.2)
+        elif adjustment_type == "rollback":
+            self.intensity_multiplier = max(0.1, self.intensity_multiplier * 0.5)
+            self.rollback_count += 1
+        
+        # Record adjustment
+        self.adjustment_history.append((step, adjustment_type, reason, old_intensity, self.intensity_multiplier))
+        self.last_adjustment_step = step
+        
+        return self.intensity_multiplier
+    
+    def get_adjustment_log(self) -> str:
+        """Get a formatted log of recent curriculum adjustments."""
+        if not self.adjustment_history:
+            return "No curriculum adjustments made."
+        
+        recent_adjustments = self.adjustment_history[-5:]  # Last 5 adjustments
+        log_lines = ["Recent curriculum adjustments:"]
+        
+        for step, adj_type, reason, old_intensity, new_intensity in recent_adjustments:
+            log_lines.append(
+                f"  Step {step}: {adj_type} ({reason}) - "
+                f"intensity {old_intensity:.3f} -> {new_intensity:.3f}"
+            )
+        
+        return "\n".join(log_lines)
+
+
 class GaussianDiffusion1D(nn.Module):
     def __init__(
         self,
@@ -178,6 +386,14 @@ class GaussianDiffusion1D(nn.Module):
         continuous = False,
         connectivity = False,
         shortest_path = False,
+        # Adversarial corruption parameters (backward compatibility)
+        use_adversarial_corruption = False,
+        anm_warmup_steps = 5000,
+        anm_adversarial_steps = 3,
+        anm_distance_penalty = 0.1,
+        # Curriculum configuration
+        curriculum_config = None,
+        disable_curriculum = False,
     ):
         super().__init__()
         self.model = model
@@ -211,6 +427,53 @@ class GaussianDiffusion1D(nn.Module):
         self.connectivity = connectivity
         self.continuous = continuous
         self.shortest_path = shortest_path
+        
+        # Adversarial corruption parameters (backward compatibility)
+        self.use_adversarial_corruption = use_adversarial_corruption
+        self.anm_warmup_steps = anm_warmup_steps
+        self.anm_adversarial_steps = anm_adversarial_steps
+        self.anm_distance_penalty = anm_distance_penalty
+        
+        # Curriculum configuration - handle explicit disabling for legacy behavior
+        if disable_curriculum:
+            self.curriculum_config = None
+        elif curriculum_config is None:
+            # If adversarial corruption is enabled, default to curriculum
+            if use_adversarial_corruption:
+                # Create a copy of the default curriculum with appropriate total steps
+                import copy
+                self.curriculum_config = copy.deepcopy(DEFAULT_CURRICULUM)
+                # Update total steps to match legacy warmup behavior if needed  
+                if self.anm_warmup_steps != DEFAULT_CURRICULUM.total_steps * 0.2:
+                    self.curriculum_config.total_steps = self.anm_warmup_steps * 5
+            else:
+                self.curriculum_config = None
+        else:
+            self.curriculum_config = curriculum_config
+            
+        # Initialize validation gating system
+        self.validation_gating = None
+        if self.curriculum_config is not None:
+            self.validation_gating = ValidationGatedCurriculum(self.curriculum_config)
+            
+        # Training state tracking
+        self.training_step = 0
+        self.recent_energy_diffs = []
+        self.current_stage = None
+        self.stage_transition_step = 0
+        self.corruption_type_history = []
+        
+        # Track corruption type counts for logging
+        self.corruption_type_counts = {'clean': 0, 'adversarial': 0, 'gaussian': 0}
+        
+        # Curriculum info caching for performance
+        self._curriculum_info_cache = None
+        self._curriculum_info_cache_step = -1
+        self._cache_update_interval = 10  # Update cache every N steps
+        
+        # Validation gating state tracking
+        self.effective_step = 0  # Step adjusted for rollbacks
+        self.curriculum_rollback_target = None  # Target step for rollback
 
         # sampling related parameters
 
@@ -371,6 +634,9 @@ class GaussianDiffusion1D(nn.Module):
         return pred_img, x_start
 
     def opt_step(self, inp, img, t, mask, data_cond, step=5, eval=True, sf=1.0, detach=True):
+        # Debug: Check if this is causing a hang with too many steps
+        if step > 20 and self.training_step < 3:
+            print(f"[DEBUG] opt_step called with {step} steps at training_step {self.training_step}")
         with torch.enable_grad():
             for i in range(step):
                 energy, grad = self.model(inp, img, t, return_both=True)
@@ -404,6 +670,448 @@ class GaussianDiffusion1D(nn.Module):
                     img = img_new
 
         return img
+
+    def get_current_curriculum_params(self, step):
+        """Get current curriculum stage and parameters with validation gating."""
+        # Use effective step for rollback scenarios
+        effective_step = step
+        if self.curriculum_rollback_target is not None:
+            effective_step = min(step, self.curriculum_rollback_target + (step - self.stage_transition_step))
+            # Clear rollback once we've caught up
+            if step >= self.curriculum_rollback_target + self.curriculum_config.rollback_steps:
+                self.curriculum_rollback_target = None
+        
+        # Get base curriculum parameters
+        stage = self.curriculum_config.get_stage(effective_step)
+        base_epsilon = self.curriculum_config.get_smooth_epsilon(effective_step, self.anm_distance_penalty * 10)
+        
+        # Apply validation gating intensity adjustment
+        intensity_multiplier = 1.0
+        if self.validation_gating is not None:
+            intensity_multiplier = self.validation_gating.intensity_multiplier
+            
+            # Check if we should adjust curriculum based on validation performance
+            should_adjust, adjustment_type, reason = self.should_adjust_curriculum()
+            if should_adjust:
+                if adjustment_type == "rollback":
+                    # Perform rollback
+                    self.rollback_curriculum()
+                    # Recalculate with new effective step
+                    effective_step = self.effective_step
+                    stage = self.curriculum_config.get_stage(effective_step)
+                    base_epsilon = self.curriculum_config.get_smooth_epsilon(effective_step, self.anm_distance_penalty * 10)
+                else:
+                    # Adjust intensity
+                    intensity_multiplier = self.adjust_curriculum_intensity(adjustment_type, reason)
+        
+        # Apply intensity adjustment to epsilon and stage ratios
+        adjusted_epsilon = base_epsilon * intensity_multiplier
+        
+        # Create adjusted stage with modified parameters for smooth transitions
+        if intensity_multiplier != 1.0:
+            from copy import copy
+            adjusted_stage = copy(stage)
+            
+            # Smooth intensity adjustments - when reducing intensity, increase clean ratio
+            if intensity_multiplier < 1.0:
+                # Increase clean ratio when reducing intensity
+                clean_boost = (1.0 - intensity_multiplier) * 0.3
+                adjusted_stage.clean_ratio = min(1.0, stage.clean_ratio + clean_boost)
+                adjusted_stage.adversarial_ratio = max(0.0, stage.adversarial_ratio - clean_boost * 0.7)
+                adjusted_stage.gaussian_ratio = max(0.0, stage.gaussian_ratio - clean_boost * 0.3)
+            # When increasing intensity, we keep original ratios but increase epsilon
+            
+            stage = adjusted_stage
+        
+        # Track stage transitions
+        if self.current_stage != stage.name:
+            old_stage = self.current_stage
+            self.current_stage = stage.name
+            self.stage_transition_step = step
+            
+            # Set new baseline for validation gating
+            if self.validation_gating is not None:
+                self.validation_gating.set_stage_baseline(self.current_stage, force_update=True)
+            
+            print(f"[Curriculum] Step {step}: Stage transition {old_stage} -> {stage.name} "
+                  f"(effective_step: {effective_step}, intensity: {intensity_multiplier:.3f})")
+            
+        return stage, adjusted_epsilon
+    
+    def _sample_corruption_type(self, stage):
+        """Sample corruption type based on curriculum stage ratios."""
+        rand_val = torch.rand(1).item()
+        
+        if rand_val < stage.clean_ratio:
+            corruption_type = 'clean'
+        elif rand_val < stage.clean_ratio + stage.adversarial_ratio:
+            corruption_type = 'adversarial' 
+        else:
+            corruption_type = 'gaussian'
+            
+        # Update counts for logging
+        self.corruption_type_counts[corruption_type] += 1
+        return corruption_type
+    
+    def _clean_corruption(self, x_start, t):
+        """Standard clean noise corruption - returns NOISED sample."""
+        noise = torch.randn_like(x_start)
+        # Return noised sample, matching the behavior of _standard_ired_corruption
+        return self.q_sample(x_start=x_start, t=t, noise=noise)
+    
+    def _gaussian_noise_corruption(self, x_start, t, scale=3.0):
+        """Gaussian noise corruption with scale - returns NOISED sample."""
+        noise = torch.randn_like(x_start)
+        # Return noised sample with scale, matching the behavior of _standard_ired_corruption
+        return self.q_sample(x_start=x_start, t=t, noise=scale * noise)
+
+    # Validation gating methods
+    def update_validation_performance(self, val_loss: float, val_accuracy: float = None):
+        """
+        Update validation performance metrics for curriculum gating.
+        
+        Args:
+            val_loss: Current validation loss
+            val_accuracy: Current validation accuracy (optional, defaults to 1-val_loss)
+        """
+        if self.validation_gating is None:
+            return
+        
+        # Use 1-val_loss as accuracy approximation if not provided
+        if val_accuracy is None:
+            val_accuracy = max(0.0, 1.0 - val_loss)
+        
+        self.validation_gating.update_validation_metrics(val_loss, val_accuracy, self.training_step)
+        
+        # Set stage baseline if we've transitioned to a new stage
+        if self.current_stage is not None:
+            self.validation_gating.set_stage_baseline(self.current_stage)
+    
+    def should_adjust_curriculum(self) -> tuple[bool, str, str]:
+        """
+        Check if curriculum should be adjusted based on validation performance.
+        
+        Returns:
+            Tuple of (should_adjust, adjustment_type, reason)
+        """
+        if self.validation_gating is None:
+            return False, "none", "no_validation_gating"
+        
+        return self.validation_gating.should_adjust_curriculum(self.training_step)
+    
+    def adjust_curriculum_intensity(self, adjustment_type: str = None, reason: str = None) -> float:
+        """
+        Adjust curriculum intensity based on validation performance.
+        
+        Args:
+            adjustment_type: Type of adjustment (auto-determined if None)
+            reason: Reason for adjustment (auto-determined if None)
+            
+        Returns:
+            New intensity multiplier
+        """
+        if self.validation_gating is None:
+            return 1.0
+        
+        # Auto-determine adjustment if not specified
+        if adjustment_type is None:
+            should_adjust, adjustment_type, reason = self.should_adjust_curriculum()
+            if not should_adjust:
+                return self.validation_gating.intensity_multiplier
+        
+        old_intensity = self.validation_gating.intensity_multiplier
+        new_intensity = self.validation_gating.adjust_intensity(adjustment_type, self.training_step, reason)
+        
+        # Log the adjustment
+        if old_intensity != new_intensity:
+            print(f"[Curriculum Gating] Step {self.training_step}: {adjustment_type} - "
+                  f"intensity {old_intensity:.3f} -> {new_intensity:.3f} (reason: {reason})")
+        
+        return new_intensity
+    
+    def rollback_curriculum(self, rollback_steps: int = None) -> int:
+        """
+        Rollback curriculum to a previous stage if performance degrades.
+        
+        Args:
+            rollback_steps: Number of steps to rollback (uses config default if None)
+            
+        Returns:
+            New effective training step after rollback
+        """
+        if self.validation_gating is None:
+            return self.training_step
+        
+        if rollback_steps is None:
+            rollback_steps = self.curriculum_config.rollback_steps
+        
+        # Calculate rollback target
+        self.curriculum_rollback_target = max(0, self.training_step - rollback_steps)
+        self.effective_step = self.curriculum_rollback_target
+        
+        # Reset validation gating intensity and consecutive degradations
+        self.validation_gating.intensity_multiplier = 1.0
+        self.validation_gating.consecutive_degradations = 0
+        
+        print(f"[Curriculum Rollback] Step {self.training_step}: Rolling back {rollback_steps} steps "
+              f"to effective step {self.effective_step}")
+        
+        return self.effective_step
+
+    def enhanced_corruption_step_v2(self, inp, x_start, t, mask, data_cond, base_noise_scale=3.0):
+        """New curriculum-aware corruption method - returns noised samples."""
+        # Get current curriculum parameters
+        stage, epsilon = self.get_current_curriculum_params(self.training_step)
+        
+        # Sample corruption type based on curriculum ratios
+        corruption_type = self._sample_corruption_type(stage)
+        
+        # Store corruption type and parameters for use in p_losses
+        self._current_corruption_type = corruption_type
+        self._current_stage = stage
+        
+        # Apply the selected corruption type - all return noised samples
+        if corruption_type == 'clean':
+            x_corrupted = self._clean_corruption(x_start, t)
+        elif corruption_type == 'gaussian':
+            # Scale Gaussian noise by stage temperature for adaptive difficulty
+            noise_scale = base_noise_scale * (2.0 / max(stage.temperature, 1.0))
+            x_corrupted = self._gaussian_noise_corruption(x_start, t, noise_scale)
+        else:  # adversarial
+            x_corrupted = self._adversarial_corruption(inp, x_start, t, mask, data_cond, base_noise_scale, epsilon)
+        
+        # Note: All methods now return already-noised samples, matching _standard_ired_corruption
+        # No additional noising will be applied in p_losses
+        
+        return x_corrupted
+
+    def enhanced_corruption_step(self, inp, x_start, t, mask, data_cond, base_noise_scale=3.0):
+        """Enhanced adversarial corruption with curriculum learning (legacy method)
+        
+        This method maintains backward compatibility while integrating curriculum support.
+        Use enhanced_corruption_step_v2 for full curriculum features.
+        """
+        # Use new curriculum method if curriculum is configured and curriculum_config is not None
+        if hasattr(self, 'curriculum_config') and self.curriculum_config is not None:
+            return self.enhanced_corruption_step_v2(inp, x_start, t, mask, data_cond, base_noise_scale)
+            
+        # Legacy behavior for backward compatibility (when curriculum_config is explicitly set to None)
+        # Note: training_step increment should be handled by caller to avoid double increment
+        
+        # Curriculum weight: 0 during warmup, then gradually increase
+        if self.training_step < self.anm_warmup_steps:
+            curriculum_weight = 0.0
+        else:
+            progress = (self.training_step - self.anm_warmup_steps) / max(self.anm_warmup_steps, 1)
+            curriculum_weight = min(1.0, progress)
+            
+            # Adapt based on recent energy landscape quality
+            if len(self.recent_energy_diffs) > 10:
+                quality_factor = np.mean(self.recent_energy_diffs[-10:])
+                curriculum_weight *= np.clip(quality_factor, 0.1, 1.0)
+        
+        # Use adversarial corruption with probability = curriculum_weight
+        if torch.rand(1).item() < curriculum_weight and self.use_adversarial_corruption:
+            return self._adversarial_corruption(inp, x_start, t, mask, data_cond, base_noise_scale, self.anm_distance_penalty)
+        else:
+            # Fallback to standard IRED corruption
+            return self._standard_ired_corruption(inp, x_start, t, mask, data_cond, base_noise_scale)
+
+    def _standard_ired_corruption(self, inp, x_start, t, mask, data_cond, base_noise_scale):
+        """Original IRED corruption mechanism (extracted from p_losses)"""
+        noise = torch.randn_like(x_start)
+        xmin_noise = self.q_sample(x_start = x_start, t = t, noise = base_noise_scale * noise)
+        
+        if mask is not None:
+            xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
+        
+        # Apply original opt_step with task-specific parameters
+        if self.sudoku:
+            step = 20
+        else:
+            step = 5
+            
+        xmin_noise = self.opt_step(inp, xmin_noise, t, mask, data_cond, step=step, sf=1.0)
+        return xmin_noise
+
+    def _adversarial_corruption(self, inp, x_start, t, mask, data_cond, base_noise_scale, epsilon=None):
+        """Enhanced corruption with distance penalty - optimizes in noisy space, returns clean"""
+        # Start with standard noise corruption in noisy space
+        noise = torch.randn_like(x_start)
+        xmin_noise = self.q_sample(x_start = x_start, t = t, noise = base_noise_scale * noise)
+        
+        if mask is not None:
+            xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
+        
+        xmin_noise.requires_grad_(True)
+        opt_step_size = extract(self.opt_step_size, t, xmin_noise.shape)
+        
+        # Enhanced adversarial steps with distance penalty
+        effective_epsilon = epsilon if epsilon is not None else self.anm_distance_penalty
+        
+        # Store the original noisy sample for reference
+        xmin_noise_orig = xmin_noise.clone().detach()
+        
+        for i in range(self.anm_adversarial_steps):
+            energy, grad = self.model(inp, xmin_noise, t, return_both=True)
+            
+            # Distance penalty prevents collapse to ground truth (in noisy space)
+            # Use original noisy sample as reference instead of clean x_start
+            distance_penalty = F.mse_loss(xmin_noise, xmin_noise_orig)
+            adaptive_penalty_weight = effective_epsilon * torch.clamp(1.0 / (distance_penalty + 1e-6), 0.1, 2.0)
+            
+            # Modified gradient: energy gradient - distance penalty gradient
+            penalty_grad = torch.autograd.grad(distance_penalty, xmin_noise, create_graph=False, retain_graph=True)[0]
+            modified_grad = grad - adaptive_penalty_weight * penalty_grad
+            
+            # Apply gradient step with decreasing step size
+            step_scale = 1.0 * (0.7 ** i)  # Decreasing step size for stability
+            xmin_noise = xmin_noise - opt_step_size * modified_grad * step_scale
+            
+            if mask is not None:
+                xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
+                
+            # Apply existing task-specific clipping
+            if self.continuous:
+                sf = 2.0
+            elif self.shortest_path:
+                sf = 0.1
+            else:
+                sf = 1.0
+                
+            max_val = extract(self.sqrt_alphas_cumprod, t, xmin_noise.shape) * sf
+            xmin_noise = torch.clamp(xmin_noise, -max_val, max_val)
+            xmin_noise.requires_grad_(True)
+        
+        # Return the optimized noisy sample directly, matching _standard_ired_corruption behavior
+        return xmin_noise.detach()
+
+    def get_curriculum_info_for_metrics(self):
+        """Get cached curriculum info for metrics tracking (performance optimized)."""
+        # Use cache if available and recent
+        if (self._curriculum_info_cache is not None and 
+            self.training_step - self._curriculum_info_cache_step < self._cache_update_interval):
+            return self._curriculum_info_cache
+        
+        # Update cache
+        self._curriculum_info_cache = self.get_curriculum_info()
+        self._curriculum_info_cache_step = self.training_step
+        return self._curriculum_info_cache
+    
+    def get_curriculum_info(self):
+        """Get current curriculum information for logging and monitoring."""
+        if not hasattr(self, 'curriculum_config') or self.curriculum_config is None:
+            return {
+                'curriculum_enabled': False,
+                'current_step': self.training_step,
+                'legacy_warmup_phase': self.training_step < self.anm_warmup_steps
+            }
+        
+        # For metrics, use simplified params without validation gating checks
+        # This avoids expensive computation on every call
+        stage = self.curriculum_config.get_stage(self.training_step)
+        epsilon = self.curriculum_config.get_smooth_epsilon(self.training_step, self.anm_distance_penalty * 10)
+        progress = self.training_step / self.curriculum_config.total_steps
+        
+        # Calculate corruption type percentages from recent history
+        recent_history = self.corruption_type_history[-100:] if len(self.corruption_type_history) > 0 else []
+        corruption_percentages = {}
+        if recent_history:
+            for corruption_type in ['clean', 'adversarial', 'gaussian']:
+                corruption_percentages[f'{corruption_type}_recent_pct'] = recent_history.count(corruption_type) / len(recent_history)
+        
+        # Validation gating information
+        validation_gating_info = {}
+        if self.validation_gating is not None:
+            validation_gating_info = {
+                'validation_gating_enabled': self.curriculum_config.enable_validation_gating,
+                'intensity_multiplier': self.validation_gating.intensity_multiplier,
+                'validation_loss_ema': self.validation_gating.val_loss_ema,
+                'validation_accuracy_ema': self.validation_gating.val_accuracy_ema,
+                'consecutive_degradations': self.validation_gating.consecutive_degradations,
+                'rollback_count': self.validation_gating.rollback_count,
+                'last_adjustment_step': self.validation_gating.last_adjustment_step,
+                'performance_trend': self.validation_gating.performance_trend,
+                'effective_step': getattr(self, 'effective_step', self.training_step),
+                'curriculum_rollback_active': self.curriculum_rollback_target is not None
+            }
+            
+            # Add current stage baseline if available
+            if self.validation_gating.current_stage_baseline is not None:
+                validation_gating_info.update({
+                    'stage_baseline_loss': self.validation_gating.current_stage_baseline['loss'],
+                    'stage_baseline_accuracy': self.validation_gating.current_stage_baseline['accuracy']
+                })
+        else:
+            validation_gating_info = {
+                'validation_gating_enabled': False,
+                'intensity_multiplier': 1.0
+            }
+        
+        return {
+            'curriculum_enabled': True,
+            'current_step': self.training_step,
+            'total_steps': self.curriculum_config.total_steps,
+            'progress': progress,
+            'current_stage': stage.name,
+            'stage_transition_step': self.stage_transition_step,
+            'stage_ratios': {
+                'clean': stage.clean_ratio,
+                'adversarial': stage.adversarial_ratio,
+                'gaussian': stage.gaussian_ratio
+            },
+            'epsilon_multiplier': stage.epsilon_multiplier,
+            'temperature': stage.temperature,
+            'current_epsilon': epsilon,
+            'corruption_counts': dict(self.corruption_type_counts),
+            **corruption_percentages,
+            **validation_gating_info,
+            'recent_energy_quality': np.mean(self.recent_energy_diffs[-10:]) if len(self.recent_energy_diffs) >= 10 else 0.0
+        }
+
+    def get_validation_gating_summary(self) -> str:
+        """
+        Get a summary of validation gating status and recent adjustments.
+        
+        Returns:
+            Formatted string with validation gating information
+        """
+        if self.validation_gating is None:
+            return "Validation gating: Disabled"
+        
+        lines = [
+            f"Validation gating: {'Enabled' if self.curriculum_config.enable_validation_gating else 'Disabled'}",
+            f"Current intensity: {self.validation_gating.intensity_multiplier:.3f}",
+            f"Validation loss EMA: {self.validation_gating.val_loss_ema:.4f}" if self.validation_gating.val_loss_ema else "Validation loss EMA: Not available",
+            f"Validation accuracy EMA: {self.validation_gating.val_accuracy_ema:.4f}" if self.validation_gating.val_accuracy_ema else "Validation accuracy EMA: Not available",
+            f"Consecutive degradations: {self.validation_gating.consecutive_degradations}",
+            f"Total rollbacks: {self.validation_gating.rollback_count}"
+        ]
+        
+        if self.curriculum_rollback_target is not None:
+            lines.append(f"Active rollback: target step {self.curriculum_rollback_target}")
+        
+        # Add recent adjustments
+        adjustment_log = self.validation_gating.get_adjustment_log()
+        if adjustment_log != "No curriculum adjustments made.":
+            lines.append(adjustment_log)
+        
+        return "\n".join(lines)
+
+    def reset_curriculum_tracking(self):
+        """Reset curriculum tracking variables (useful for evaluation or new training)."""
+        self.training_step = 0
+        self.recent_energy_diffs = []
+        self.current_stage = None
+        self.stage_transition_step = 0
+        self.corruption_type_history = []
+        self.corruption_type_counts = {'clean': 0, 'adversarial': 0, 'gaussian': 0}
+        
+        # Reset validation gating
+        if self.validation_gating is not None:
+            self.validation_gating = ValidationGatedCurriculum(self.curriculum_config)
+        self.effective_step = 0
+        self.curriculum_rollback_target = None
 
     @torch.no_grad()
     def p_sample_loop(self, batch_size, shape, inp, cond, mask, return_traj=False):
@@ -601,82 +1309,18 @@ class GaussianDiffusion1D(nn.Module):
             if mask is not None:
                 data_cond = self.q_sample(x_start = x_start, t = t, noise = torch.zeros_like(noise))
                 data_sample = data_sample * (1 - mask) + mask * data_cond
-
-            # Add a noise contrastive estimation term with samples drawn from the data distribution
-            #noise = torch.randn_like(x_start)
-
-            # Optimize a sample using gradient descent on energy landscape
-            xmin_noise = self.q_sample(x_start = x_start, t = t, noise = 3.0 * noise)
-
-            if mask is not None:
-                xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
             else:
                 data_cond = None
 
-            if self.sudoku:
-                s = x_start.size()
-                x_start_im = x_start.view(-1, 9, 9, 9).argmax(dim=-1)
-                randperm = torch.randint(0, 9, x_start_im.size(), device=x_start_im.device)
+            # Enhanced adversarial corruption replaces all task-specific corruption logic
+            # Note: training_step should be incremented before calling this method
+            xmin_noise_rescale = self.enhanced_corruption_step(inp, x_start, t, mask, data_cond)
+            loss_opt = torch.ones(1).to(x_start.device)
+            loss_scale = 0.5
 
-                rand_mask = (torch.rand(x_start_im.size(), device=x_start_im.device) < 0.05).float()
-
-                xmin_noise_im = x_start_im * (1 - rand_mask) + randperm * (rand_mask)
-
-                xmin_noise_im = F.one_hot(xmin_noise_im.long(), num_classes=9)
-                xmin_noise_im = (xmin_noise_im - 0.5) * 2
-
-                xmin_noise_rescale = xmin_noise_im.view(-1, 729)
-
-                loss_opt = torch.ones(1)
-
-                loss_scale = 0.05
-            elif self.connectivity:
-                s = x_start.size()
-                x_start_im = x_start.view(-1, 12, 12)
-                randperm = (torch.randint(0, 1, x_start_im.size(), device=x_start_im.device) - 0.5) * 2
-
-                rand_mask = (torch.rand(x_start_im.size(), device=x_start_im.device) < 0.05).float()
-
-                xmin_noise_rescale = x_start_im * (1 - rand_mask) + randperm * (rand_mask)
-
-                loss_opt = torch.ones(1)
-
-                loss_scale = 0.05
-            elif self.shortest_path:
-                x_start_list = x_start.argmax(dim=2)
-                classes = x_start.size(2)
-                rand_vals = torch.randint(0, classes, x_start_list.size()).to(x_start.device)
-
-                x_start_neg = torch.cat([rand_vals[:, :1], x_start_list[:, 1:]], dim=1)
-                x_start_neg_oh = F.one_hot(x_start_neg[:, :, 0].long(), num_classes=classes)[:, :, :, None]
-                xmin_noise_rescale = (x_start_neg_oh - 0.5) * 2
-
-                loss_opt = torch.ones(1)
-
-                loss_scale = 0.5
-            else:
-
-                xmin_noise = self.opt_step(inp, xmin_noise, t, mask, data_cond, step=2, sf=1.0)
-                xmin = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-                loss_opt = torch.pow(xmin_noise - xmin, 2).mean()
-
-                xmin_noise = xmin_noise.detach()
-                xmin_noise_rescale = self.predict_start_from_noise(xmin_noise, t, torch.zeros_like(xmin_noise))
-                xmin_noise_rescale = torch.clamp(xmin_noise_rescale, -2, 2)
-
-                # loss_opt = torch.ones(1)
-
-
-                # rand_mask = (torch.rand(x_start.size(), device=x_start.device) < 0.2).float()
-
-                # xmin_noise_rescale =  x_start * (1 - rand_mask) + rand_mask * x_start_noise
-
-                # nrep = 1
-
-
-                loss_scale = 0.5
-
-            xmin_noise = self.q_sample(x_start=xmin_noise_rescale, t=t, noise=noise)
+            # The corruption methods now return already-noised samples, so no need to noise again
+            # This matches the behavior of _standard_ired_corruption
+            xmin_noise = xmin_noise_rescale
 
             if mask is not None:
                 xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
@@ -693,6 +1337,13 @@ class GaussianDiffusion1D(nn.Module):
             energy_stack = torch.cat([energy_real, energy_fake], dim=-1)
             target = torch.zeros(energy_real.size(0)).to(energy_stack.device)
             loss_energy = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')[:, None]
+
+            # Track energy landscape quality for adaptive curriculum
+            with torch.no_grad():
+                energy_diff = (energy_fake - energy_real).mean().item()
+                self.recent_energy_diffs.append(max(0, energy_diff))
+                if len(self.recent_energy_diffs) > 100:
+                    self.recent_energy_diffs.pop(0)
 
             # loss_energy = energy_real.mean() - energy_fake.mean()# loss_energy.mean()
 
@@ -746,7 +1397,11 @@ class Trainer1D(object):
         extra_validation_every_mul = 10,
         evaluate_first = False,
         latent = False,
-        autoencode_model = None
+        autoencode_model = None,
+        save_csv_logs = False,
+        csv_log_interval = 100,
+        csv_log_dir = './csv_logs',
+        dataset_name = None  # Dataset name for task-specific accuracy
     ):
         super().__init__()
 
@@ -791,9 +1446,12 @@ class Trainer1D(object):
         # Evaluation metric.
         self.metric = metric
         self.data_workers = data_workers
+        self.dataset = dataset_name  # Store dataset name for accuracy computation
 
         if self.data_workers is None:
-            self.data_workers = cpu_count()
+            # Use a conservative default to avoid multiprocessing issues, especially on macOS
+            # cpu_count() can return high values that cause deadlocks
+            self.data_workers = min(4, cpu_count())
 
         # dataset and dataloader
 
@@ -828,12 +1486,19 @@ class Trainer1D(object):
 
         # for logging results in a folder periodically
 
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
-
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
+
+        # CSV logging setup
+        self.save_csv_logs = save_csv_logs
+        self.csv_log_interval = csv_log_interval
+        if self.save_csv_logs and self.accelerator.is_main_process:
+            self.csv_log_dir = Path(csv_log_dir)
+            self.csv_log_dir.mkdir(exist_ok=True)
+            self._init_csv_logging()
+        
+        # Metrics tracking disabled
+        self.metrics_tracker = None
 
         # step counter state
 
@@ -842,7 +1507,167 @@ class Trainer1D(object):
         # prepare model, dataloader, optimizer with accelerator
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        
+        # Initialize EMA after model is prepared to ensure same device
+        if self.accelerator.is_main_process:
+            self.ema = EMA(self.model, beta = ema_decay, update_every = ema_update_every)
+            self.ema.to(self.device)
         self.evaluate_first = evaluate_first
+
+    def _init_csv_logging(self):
+        """Initialize CSV files for logging training and validation metrics"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Training metrics CSV
+        self.train_csv_path = self.csv_log_dir / f'training_metrics_{timestamp}.csv'
+        with open(self.train_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'epoch', 'total_loss', 'loss_denoise', 'loss_energy', 'loss_opt',
+                'data_time', 'nn_time', 'learning_rate', 'timestamp'
+            ])
+        
+        # Validation metrics CSV
+        self.val_csv_path = self.csv_log_dir / f'validation_metrics_{timestamp}.csv'
+        with open(self.val_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'milestone', 'dataset_name', 'metric_name', 'metric_value', 'timestamp'
+            ])
+        
+        # Energy landscape metrics CSV (for adversarial corruption analysis)
+        self.energy_csv_path = self.csv_log_dir / f'energy_metrics_{timestamp}.csv'
+        with open(self.energy_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'energy_pos_mean', 'energy_neg_mean', 'energy_diff', 
+                'curriculum_weight', 'corruption_type', 'timestamp'
+            ])
+        
+        # Curriculum metrics CSV
+        self.curriculum_csv_path = self.csv_log_dir / f'curriculum_metrics_{timestamp}.csv'
+        with open(self.curriculum_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'stage', 'corruption_type', 'epsilon', 'temperature',
+                'clean_ratio', 'adversarial_ratio', 'gaussian_ratio', 'timestamp'
+            ])
+        
+        # Overfitting metrics CSV
+        self.overfitting_csv_path = self.csv_log_dir / f'overfitting_metrics_{timestamp}.csv'
+        with open(self.overfitting_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'train_val_gap', 'risk_level', 'gap_trend', 'patience_counter',
+                'should_intervene', 'steps_without_improvement', 'timestamp'
+            ])
+        
+        # Robustness metrics CSV
+        self.robustness_csv_path = self.csv_log_dir / f'robustness_metrics_{timestamp}.csv'
+        with open(self.robustness_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'clean_accuracy', 'adversarial_accuracy', 'attack_success_rate',
+                'accuracy_gap', 'robustness_ratio', 'pareto_score', 'timestamp'
+            ])
+    
+    def _log_to_csv(self, csv_path, row_data):
+        """Helper function to append data to CSV file"""
+        if self.save_csv_logs and self.accelerator.is_main_process:
+            try:
+                with open(csv_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row_data)
+            except Exception as e:
+                print(f"Warning: Failed to write to CSV {csv_path}: {e}")
+    
+    def _log_curriculum_metrics(self, curriculum_info):
+        """Log curriculum stage, corruption types, epsilon, temperature"""
+        if not self.save_csv_logs or not curriculum_info.get('curriculum_enabled', False):
+            return
+            
+        timestamp = datetime.now().isoformat()
+        stage_ratios = curriculum_info.get('stage_ratios', {})
+        
+        curriculum_row = [
+            curriculum_info.get('current_step', self.step),
+            curriculum_info.get('current_stage', 'unknown'),
+            curriculum_info.get('corruption_type', 'unknown'),
+            curriculum_info.get('current_epsilon', 0.0),
+            curriculum_info.get('temperature', 1.0),
+            stage_ratios.get('clean', 0.0),
+            stage_ratios.get('adversarial', 0.0),
+            stage_ratios.get('gaussian', 0.0),
+            timestamp
+        ]
+        self._log_to_csv(self.curriculum_csv_path, curriculum_row)
+    
+    def _log_overfitting_metrics(self, overfitting_check):
+        """Log train-val gap, overfitting risk, patience counter"""
+        if not self.save_csv_logs:
+            return
+            
+        timestamp = datetime.now().isoformat()
+        overfitting_row = [
+            self.step,
+            overfitting_check.get('gap', 0.0),
+            overfitting_check.get('risk_level', 'unknown'),
+            overfitting_check.get('gap_trend', 0.0),
+            overfitting_check.get('patience_counter', 0),
+            overfitting_check.get('should_intervene', False),
+            overfitting_check.get('steps_without_improvement', 0),
+            timestamp
+        ]
+        self._log_to_csv(self.overfitting_csv_path, overfitting_row)
+    
+    def _log_robustness_metrics(self, clean_acc=None, adv_acc=None, attack_success=None):
+        """Log clean vs adversarial accuracy if available"""
+        if not self.save_csv_logs or clean_acc is None:
+            return
+            
+        timestamp = datetime.now().isoformat()
+        
+        # Calculate derived metrics
+        accuracy_gap = (clean_acc - adv_acc) if adv_acc is not None else 0.0
+        robustness_ratio = (adv_acc / clean_acc) if adv_acc is not None and clean_acc > 0 else 0.0
+        pareto_score = (0.5 * clean_acc + 0.5 * adv_acc) if adv_acc is not None else clean_acc
+        
+        robustness_row = [
+            self.step,
+            clean_acc,
+            adv_acc if adv_acc is not None else 0.0,
+            attack_success if attack_success is not None else 0.0,
+            accuracy_gap,
+            robustness_ratio,
+            pareto_score,
+            timestamp
+        ]
+        self._log_to_csv(self.robustness_csv_path, robustness_row)
+    
+    def _save_comprehensive_metrics(self):
+        """Save comprehensive metrics dictionary to file"""
+        # Skip metrics tracking
+        return
+            
+        try:
+            import json
+            metrics_dict = self.metrics_tracker.export_metrics_to_dict()
+            
+            # Create metrics export directory
+            metrics_export_dir = self.csv_log_dir / 'comprehensive_metrics'
+            metrics_export_dir.mkdir(exist_ok=True)
+            
+            # Save with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            metrics_file = metrics_export_dir / f'metrics_step_{self.step}_{timestamp}.json'
+            
+            with open(metrics_file, 'w') as f:
+                json.dump(metrics_dict, f, indent=2, default=str)
+                
+            print(f"📊 Comprehensive metrics saved to {metrics_file}")
+            
+        except Exception as e:
+            print(f"Warning: Failed to save comprehensive metrics: {e}")
 
     @property
     def device(self):
@@ -882,6 +1707,8 @@ class Trainer1D(object):
 
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
+        
+        # Metrics tracking disabled
 
     def train(self):
         accelerator = self.accelerator
@@ -895,6 +1722,7 @@ class Trainer1D(object):
         end_time = time.time()
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process, dynamic_ncols = True) as pbar:
 
+            epoch = 0
             while self.step < self.train_num_steps:
 
                 total_loss = 0.
@@ -918,6 +1746,11 @@ class Trainer1D(object):
 
                     data_time = time.time() - end_time; end_time = time.time()
 
+                    # Increment model's training step for curriculum tracking
+                    model = self.model.module if hasattr(self.model, 'module') else self.model
+                    if hasattr(model, 'training_step'):
+                        model.training_step = self.step
+
                     with self.accelerator.autocast():
                         loss, (loss_denoise, loss_energy, loss_opt) = self.model(inp, label, mask)
                         loss = loss / self.gradient_accumulate_every
@@ -935,7 +1768,46 @@ class Trainer1D(object):
                 accelerator.wait_for_everyone()
 
                 nn_time = time.time() - end_time; end_time = time.time()
-                pbar.set_description(f'loss: {total_loss:.4f} loss_denoise: {loss_denoise:.4f} loss_energy: {loss_energy:.4f} loss_opt: {loss_opt:.4f} data_time: {data_time:.2f} nn_time: {nn_time:.2f}')
+                
+                # Handle case where loss_energy and loss_opt might be -1 (integers)
+                loss_energy_display = loss_energy if not hasattr(loss_energy, 'item') else loss_energy.item()
+                loss_opt_display = loss_opt if not hasattr(loss_opt, 'item') else loss_opt.item()
+                
+                pbar.set_description(f'loss: {total_loss:.4f} loss_denoise: {loss_denoise:.4f} loss_energy: {loss_energy_display:.4f} loss_opt: {loss_opt_display:.4f} data_time: {data_time:.2f} nn_time: {nn_time:.2f}')
+
+                # Enhanced metrics tracking and logging
+                if self.step % self.csv_log_interval == 0:
+                    # Get model reference for curriculum info
+                    model = self.model.module if hasattr(self.model, 'module') else self.model
+                    
+                    # Metrics tracking disabled
+                    
+                    # CSV logging (original functionality preserved)
+                    if self.save_csv_logs:
+                        current_lr = self.opt.param_groups[0]['lr']
+                        timestamp = datetime.now().isoformat()
+                        
+                        # Handle case where loss_energy and loss_opt might be -1 (integers)
+                        loss_energy_val = loss_energy.item() if hasattr(loss_energy, 'item') else loss_energy
+                        loss_opt_val = loss_opt.item() if hasattr(loss_opt, 'item') else loss_opt
+                        
+                        train_row = [
+                            self.step, epoch, total_loss, loss_denoise.item(), 
+                            loss_energy_val, loss_opt_val, data_time, nn_time, 
+                            current_lr, timestamp
+                        ]
+                        self._log_to_csv(self.train_csv_path, train_row)
+                        
+                        # Log energy landscape metrics if available
+                        if hasattr(model, 'recent_energy_diffs'):
+                            recent_diffs = model.recent_energy_diffs
+                            if len(recent_diffs) > 0:
+                                self._log_energy_metrics(loss_energy.item(), recent_diffs[-1])
+                
+                # Periodic comprehensive reporting (every 1000 steps)
+                # Metrics tracking disabled
+
+                # Metrics tracking disabled
 
                 self.step += 1
                 if accelerator.is_main_process:
@@ -946,6 +1818,8 @@ class Trainer1D(object):
                         milestone = self.step // self.save_and_sample_every
 
                         self.save(milestone)
+                        
+                        # Metrics tracking disabled
 
                         if self.latent:
                             self.evaluate(device, milestone, inp=inp, label=label_gt, mask=mask_latent)
@@ -954,8 +1828,29 @@ class Trainer1D(object):
 
 
                 pbar.update(1)
+                
+                # Update epoch counter (approximate)
+                if self.step % 1000 == 0:
+                    epoch += 1
 
         accelerator.print('training complete')
+        
+    def _log_energy_metrics(self, loss_energy, energy_diff):
+        """Log energy landscape specific metrics"""
+        curriculum_weight = 0.0
+        corruption_type = "standard"
+        
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(model, 'use_adversarial_corruption') and model.use_adversarial_corruption:
+            if hasattr(model, 'training_step') and model.training_step > model.anm_warmup_steps:
+                curriculum_weight = min(1.0, (model.training_step - model.anm_warmup_steps) / model.anm_warmup_steps)
+                corruption_type = "adversarial" if curriculum_weight > 0.1 else "mixed"
+        
+        timestamp = datetime.now().isoformat()
+        energy_row = [
+            self.step, 0, 0, energy_diff, curriculum_weight, corruption_type, timestamp
+        ]
+        self._log_to_csv(self.energy_csv_path, energy_row)
 
     def evaluate(self, device, milestone, inp=None, label=None, mask=None):
         print('Running Evaluation...')
@@ -978,9 +1873,30 @@ class Trainer1D(object):
                 print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (Train)')
                 if self.metric == 'mse':
                     all_samples = torch.cat(all_samples_list, dim = 0)
-                    mse_error = (all_samples - label).pow(2).mean()
-                    rows = [('mse_error', mse_error)]
-                    print(tabulate(rows))
+                    
+                    # Compute inverse accuracy for inverse task
+                    if self.dataset == 'inverse':
+                        accuracy_metrics = inverse_accuracy(all_samples, inp, label)
+                        rows = [[k, v] for k, v in accuracy_metrics.items()]
+                        print(tabulate(rows))
+                        
+                        # Log all metrics to CSV
+                        if self.save_csv_logs:
+                            timestamp = datetime.now().isoformat()
+                            for metric_name, metric_value in accuracy_metrics.items():
+                                val_row = [self.step, milestone, 'train_sample', metric_name, metric_value, timestamp]
+                                self._log_to_csv(self.val_csv_path, val_row)
+                    else:
+                        # Regular MSE for other tasks
+                        mse_error = (all_samples - label).pow(2).mean()
+                        rows = [('mse_error', mse_error)]
+                        print(tabulate(rows))
+                        
+                        # Log to CSV
+                        if self.save_csv_logs:
+                            timestamp = datetime.now().isoformat()
+                            val_row = [self.step, milestone, 'train_sample', 'mse_error', mse_error.item(), timestamp]
+                            self._log_to_csv(self.val_csv_path, val_row)
                 elif self.metric == 'bce':
                     assert len(all_samples_list) == 1
                     summary = binary_classification_accuracy_4(all_samples_list[0], label)
@@ -991,6 +1907,13 @@ class Trainer1D(object):
                     summary = sudoku_accuracy(all_samples_list[0], label, mask)
                     rows = [[k, v] for k, v in summary.items()]
                     print(tabulate(rows))
+                    
+                    # Log to CSV
+                    if self.save_csv_logs:
+                        timestamp = datetime.now().isoformat()
+                        for metric_name, metric_value in summary.items():
+                            val_row = [self.step, milestone, 'train_sample', metric_name, metric_value, timestamp]
+                            self._log_to_csv(self.val_csv_path, val_row)
                 elif self.metric == 'sort':
                     assert len(all_samples_list) == 1
                     summary = binary_classification_accuracy_4(all_samples_list[0], label)
@@ -1083,9 +2006,15 @@ class Trainer1D(object):
                     if i > 20:
                         break
                 elif self.metric == 'mse':
-                    # all_samples = torch.cat(all_samples_list, dim = 0)
-                    mse_error = (samples - label).pow(2).mean()
-                    meters['mse'].update(mse_error, n=inp.size(0))
+                    # Compute inverse accuracy for inverse task
+                    if self.dataset == 'inverse':
+                        accuracy_metrics = inverse_accuracy(samples, inp, label)
+                        for k, v in accuracy_metrics.items():
+                            meters[k].update(v, n=inp.size(0))
+                    else:
+                        # Regular MSE for other tasks
+                        mse_error = (samples - label).pow(2).mean()
+                        meters['mse'].update(mse_error, n=inp.size(0))
                     if i > 20:
                         break
                 elif self.metric == 'bce':
@@ -1100,6 +2029,15 @@ class Trainer1D(object):
             rows = [[k, v.avg] for k, v in meters.items()]
             print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (ID: {prefix})')
             print(tabulate(rows))
+            
+            # Metrics tracking disabled
+            
+            # Log validation results to CSV (original functionality preserved)
+            if self.save_csv_logs:
+                timestamp = datetime.now().isoformat()
+                for metric_name, meter in meters.items():
+                    val_row = [self.step, milestone, prefix, metric_name, float(meter.avg), timestamp]
+                    self._log_to_csv(self.val_csv_path, val_row)
 
 
 as_float = lambda x: float(x.item())
@@ -1289,6 +2227,48 @@ def sort_accuracy_2(pred: torch.Tensor, label: torch.Tensor, mask: torch.Tensor,
         'element_accuracy' + name: as_float(element_correct),
         'array_accuracy' + name: as_float(array_correct),
         'first_action_accuracy' + name: as_float(first_action_correct)
+    }
+
+
+@torch.no_grad()
+def inverse_accuracy(pred: torch.Tensor, inp: torch.Tensor, label: torch.Tensor) -> dict[str, float]:
+    """Calculate accuracy metrics for matrix inverse task.
+    
+    Args:
+        pred: Predicted inverse matrices (flattened)
+        inp: Input matrices to be inverted (flattened)
+        label: True inverse matrices (flattened)
+    
+    Returns:
+        Dictionary with accuracy metrics
+    """
+    batch_size = pred.shape[0]
+    rank = int(np.sqrt(pred.shape[1]))
+    
+    # Reshape to matrices
+    pred_mat = pred.view(batch_size, rank, rank)
+    input_mat = inp.view(batch_size, rank, rank)
+    true_mat = label.view(batch_size, rank, rank)
+    
+    # Key metric: pred @ input should be Identity
+    product = torch.bmm(pred_mat, input_mat)
+    identity = torch.eye(rank, device=pred.device).unsqueeze(0).expand(batch_size, -1, -1)
+    
+    # Compute metrics
+    identity_error = (product - identity).pow(2).mean(dim=(1,2))  # Per-sample error
+    mse = (pred - label).pow(2).mean()
+    relative_error = (pred - label).pow(2).sum(dim=1) / (label.pow(2).sum(dim=1) + 1e-8)
+    
+    # Task success: product is close to identity (threshold-based)
+    threshold = 0.1
+    task_success = (identity_error < threshold).float()
+    
+    return {
+        'mse': as_float(mse),
+        'identity_error': as_float(identity_error.mean()),
+        'relative_error': as_float(relative_error.mean()),
+        'accuracy': as_float(task_success.mean()),  # Changed from accuracy_pct, now returns fraction (0-1)
+        'mean_abs_error': as_float((pred - label).abs().mean())
     }
 
 

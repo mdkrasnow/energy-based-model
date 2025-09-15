@@ -433,6 +433,22 @@ class Inverse(data.Dataset):
         self.split = split
         self.inp_dim = self.h * self.w
         self.out_dim = self.h * self.w
+        
+        # Define split-specific offsets to ensure no overlap
+        # Train: indices 0 to 999,999 (offset 0)
+        # Val: indices 1,000,000 to 1,999,999 (offset 1e6)
+        # Test: indices 2,000,000 to 2,999,999 (offset 2e6)
+        if split == "train":
+            self.index_offset = 0
+        elif split == "val" or split == "validation":
+            self.index_offset = int(1e6)
+        elif split == "test":
+            self.index_offset = int(2e6)
+        else:
+            self.index_offset = int(3e6)  # For any other split
+            
+        # Base seed for reproducibility
+        self.base_seed = 42
 
     def __getitem__(self, index):
         """Return a data point and its metadata information.
@@ -444,8 +460,16 @@ class Inverse(data.Dataset):
             A(tensor) - - an image in one domain
             A_paths(str) - - the path of the image
         """
+        
+        # Create deterministic seed based on index and split
+        # This ensures each sample is reproducible and splits never overlap
+        actual_index = index + self.index_offset
+        seed = self.base_seed + actual_index
+        
+        # Create a local random state to avoid affecting global state
+        rng = np.random.RandomState(seed)
 
-        R_corrupt = np.random.uniform(-1, 1, (self.h, self.w))
+        R_corrupt = rng.uniform(-1, 1, (self.h, self.w))
         R_corrupt = R_corrupt.dot(R_corrupt.transpose())
         # R_corrupt = R_corrupt + 0.5 * np.eye(self.h)
 
@@ -457,7 +481,8 @@ class Inverse(data.Dataset):
         R = np.linalg.inv(R_corrupt)
         # R = np.linalg.solve(R_corrupt, np.eye(self.h))
 
-        return R_corrupt.flatten(), R.flatten()
+        # Convert to float32 to avoid MPS issues
+        return R_corrupt.flatten().astype(np.float32), R.flatten().astype(np.float32)
 
     def __len__(self):
         """Return the total number of images in the dataset."""

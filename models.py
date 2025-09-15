@@ -1,5 +1,4 @@
 from diffusion_lib.nlm import LogicMachine
-from diffusion_lib.transformer import GPT
 import einops
 import torch.nn as nn
 from torch import einsum
@@ -463,45 +462,6 @@ class SudokuDenoise(nn.Module):
         output = einops.rearrange(output, 'b c h w -> b (h w c)')
         return output
 
-
-class SudokuTransformerEBM(nn.Module):
-    def __init__(self, inp_dim, out_dim):
-        super().__init__()
-        assert inp_dim == out_dim == 729
-
-        self.inp_dim = inp_dim
-        self.out_dim = out_dim
-
-        nr_layers = 1
-        nr_heads = 4
-        hidden_dim = 128
-
-        fourier_dim = 128
-        sinu_pos_emb = SinusoidalPosEmb(fourier_dim)
-        self.time_mlp = nn.Sequential(
-            sinu_pos_emb,
-            nn.Linear(fourier_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
-        self.input_embedding = nn.Linear(18, hidden_dim)
-        self.transformer = GPT(nr_layers=nr_layers, nr_heads=nr_heads, hidden_dim=hidden_dim, output_dim=9, max_length=81)
-
-    def forward(self, x, t):
-        inp, out = torch.chunk(x, 2, dim=-1)
-        t_emb = self.time_mlp(t)
-
-        x = einops.rearrange(inp, 'b (h w c) -> b (h w) c', h=9, w=9)
-        y = einops.rearrange(out, 'b (h w c) -> b (h w) c', h=9, w=9)
-        x = torch.cat((x, y), dim=-1)
-
-        h = self.input_embedding(x) + t_emb[:, None, :]
-        h = self.transformer(h)
-
-        energy = (y - h).pow(2).sum(dim=-1).sum(dim=-1)[:, None]
-        # energy = h.squeeze(-1).sum(dim=-1)
-        return energy
 
 
 class GraphEBM(nn.Module):

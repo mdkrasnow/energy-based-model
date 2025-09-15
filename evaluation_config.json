@@ -1,0 +1,65 @@
+{
+  "models": [
+    {
+      "name": "mlp_inverse_baseline",
+      "checkpoint": "results/ds_inverse/model_mlp/model-1.pt",
+      "model_type": "mlp",
+      "dataset": "inverse"
+    },
+    {
+      "name": "mlp_inverse_diffsteps_10",
+      "checkpoint": "results/ds_inverse/model_mlp_diffsteps_10/model-1.pt",
+      "model_type": "mlp",
+      "dataset": "inverse"
+    },
+    {
+      "name": "mlp_addition",
+      "checkpoint": "results/ds_addition/model_mlp/model-1.pt",
+      "model_type": "mlp",
+      "dataset": "addition"
+    },
+    {
+      "name": "mlp_lowrank",
+      "checkpoint": "results/ds_lowrank/model_mlp/model-1.pt",
+      "model_type": "mlp",
+      "dataset": "lowrank"
+    },
+    {
+      "name": "sudoku_model",
+      "checkpoint": "results/ds_sudoku/model_sudoku/model-1.pt",
+      "model_type": "sudoku",
+      "dataset": "sudoku"
+    },
+    {
+      "name": "gnn_connectivity",
+      "checkpoint": "results/ds_connectivity/model_gnn/model-1.pt",
+      "model_type": "gnn",
+      "dataset": "connectivity"
+    }
+  ],
+  "datasets": {
+    "inverse": {
+      "rank": 20,
+      "ood": false
+    },
+    "addition": {
+      "rank": 20,
+      "ood": false
+    },
+    "lowrank": {
+      "rank": 20,
+      "ood": false
+    },
+    "sudoku": {},
+    "connectivity": {},
+    "parents": {}
+  },
+  "batch_size": 256,
+  "num_samples": 1000,
+  "diffusion_steps": 10,
+  "evaluation_settings": {
+    "save_individual_predictions": false,
+    "compute_confidence_intervals": true,
+    "num_bootstrap_samples": 100
+  }
+}
