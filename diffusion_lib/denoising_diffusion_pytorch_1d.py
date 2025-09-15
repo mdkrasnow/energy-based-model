@@ -178,6 +178,11 @@ class GaussianDiffusion1D(nn.Module):
         continuous = False,
         connectivity = False,
         shortest_path = False,
+        # ADD THESE 4 LINES:
+        use_adversarial_corruption = False,
+        anm_warmup_steps = 5000,
+        anm_adversarial_steps = 3,
+        anm_distance_penalty = 0.1,
     ):
         super().__init__()
         self.model = model
@@ -211,6 +216,13 @@ class GaussianDiffusion1D(nn.Module):
         self.connectivity = connectivity
         self.continuous = continuous
         self.shortest_path = shortest_path
+        # ADD THESE 5 LINES:
+        self.use_adversarial_corruption = use_adversarial_corruption
+        self.anm_warmup_steps = anm_warmup_steps
+        self.anm_adversarial_steps = anm_adversarial_steps
+        self.anm_distance_penalty = anm_distance_penalty
+        self.training_step = 0
+        self.recent_energy_diffs = []
 
         # sampling related parameters
 
@@ -404,6 +416,100 @@ class GaussianDiffusion1D(nn.Module):
                     img = img_new
 
         return img
+
+    def enhanced_corruption_step(self, inp, x_start, t, mask, data_cond, base_noise_scale=3.0):
+        """Enhanced adversarial corruption with curriculum learning
+        
+        Args:
+            inp: Input condition
+            x_start: Ground truth target  
+            t: Timestep
+            mask: Conditioning mask (for tasks like Sudoku)
+            data_cond: Conditional data
+            base_noise_scale: Noise scaling factor (matches IRED's 3.0)
+        """
+        self.training_step += 1
+        
+        # Curriculum weight: 0 during warmup, then gradually increase
+        if self.training_step < self.anm_warmup_steps:
+            curriculum_weight = 0.0
+        else:
+            progress = (self.training_step - self.anm_warmup_steps) / self.anm_warmup_steps
+            curriculum_weight = min(1.0, progress)
+            
+            # Adapt based on recent energy landscape quality
+            if len(self.recent_energy_diffs) > 10:
+                quality_factor = np.mean(self.recent_energy_diffs[-10:])
+                curriculum_weight *= np.clip(quality_factor, 0.1, 1.0)
+        
+        # Use adversarial corruption with probability = curriculum_weight
+        if torch.rand(1).item() < curriculum_weight and self.use_adversarial_corruption:
+            return self._adversarial_corruption(inp, x_start, t, mask, data_cond, base_noise_scale)
+        else:
+            # Fallback to standard IRED corruption
+            return self._standard_ired_corruption(inp, x_start, t, mask, data_cond, base_noise_scale)
+
+    def _standard_ired_corruption(self, inp, x_start, t, mask, data_cond, base_noise_scale):
+        """Original IRED corruption mechanism (extracted from p_losses)"""
+        noise = torch.randn_like(x_start)
+        xmin_noise = self.q_sample(x_start = x_start, t = t, noise = base_noise_scale * noise)
+        
+        if mask is not None:
+            xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
+        
+        # Apply original opt_step with task-specific parameters
+        if self.sudoku:
+            step = 20
+        else:
+            step = 5
+            
+        xmin_noise = self.opt_step(inp, xmin_noise, t, mask, data_cond, step=step, sf=1.0)
+        return xmin_noise
+
+    def _adversarial_corruption(self, inp, x_start, t, mask, data_cond, base_noise_scale):
+        """Enhanced corruption with distance penalty to generate harder negatives"""
+        # Start with standard noise corruption  
+        noise = torch.randn_like(x_start)
+        xmin_noise = self.q_sample(x_start = x_start, t = t, noise = base_noise_scale * noise)
+        
+        if mask is not None:
+            xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
+        
+        xmin_noise.requires_grad_(True)
+        opt_step_size = extract(self.opt_step_size, t, xmin_noise.shape)
+        
+        # Enhanced adversarial steps with distance penalty
+        for i in range(self.anm_adversarial_steps):
+            energy, grad = self.model(inp, xmin_noise, t, return_both=True)
+            
+            # Distance penalty prevents collapse to ground truth
+            distance_penalty = F.mse_loss(xmin_noise, x_start)
+            adaptive_penalty_weight = self.anm_distance_penalty * torch.clamp(1.0 / (distance_penalty + 1e-6), 0.1, 2.0)
+            
+            # Modified gradient: energy gradient - distance penalty gradient
+            penalty_grad = torch.autograd.grad(distance_penalty, xmin_noise, create_graph=False, retain_graph=True)[0]
+            modified_grad = grad - adaptive_penalty_weight * penalty_grad
+            
+            # Apply gradient step with decreasing step size
+            step_scale = 1.0 * (0.7 ** i)  # Decreasing step size for stability
+            xmin_noise = xmin_noise - opt_step_size * modified_grad * step_scale
+            
+            if mask is not None:
+                xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
+                
+            # Apply existing task-specific clipping (copied from original code)
+            if self.continuous:
+                sf = 2.0
+            elif self.shortest_path:
+                sf = 0.1
+            else:
+                sf = 1.0
+                
+            max_val = extract(self.sqrt_alphas_cumprod, t, xmin_noise.shape) * sf
+            xmin_noise = torch.clamp(xmin_noise, -max_val, max_val)
+            xmin_noise.requires_grad_(True)
+        
+        return xmin_noise.detach()
 
     @torch.no_grad()
     def p_sample_loop(self, batch_size, shape, inp, cond, mask, return_traj=False):
