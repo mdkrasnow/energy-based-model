@@ -1051,8 +1051,9 @@ class Trainer1D(object):
                     self._log_to_csv(self.train_csv_path, train_row)
                     
                     # Log energy landscape metrics if available
-                    if hasattr(self.model.module, 'recent_energy_diffs'):
-                        recent_diffs = self.model.module.recent_energy_diffs
+                    model = self.model.module if hasattr(self.model, 'module') else self.model
+                    if hasattr(model, 'recent_energy_diffs'):
+                        recent_diffs = model.recent_energy_diffs
                         if len(recent_diffs) > 0:
                             self._log_energy_metrics(loss_energy.item(), recent_diffs[-1])
 
@@ -1085,9 +1086,10 @@ class Trainer1D(object):
         curriculum_weight = 0.0
         corruption_type = "standard"
         
-        if hasattr(self.model.module, 'use_adversarial_corruption') and self.model.module.use_adversarial_corruption:
-            if hasattr(self.model.module, 'training_step') and self.model.module.training_step > self.model.module.anm_warmup_steps:
-                curriculum_weight = min(1.0, (self.model.module.training_step - self.model.module.anm_warmup_steps) / self.model.module.anm_warmup_steps)
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(model, 'use_adversarial_corruption') and model.use_adversarial_corruption:
+            if hasattr(model, 'training_step') and model.training_step > model.anm_warmup_steps:
+                curriculum_weight = min(1.0, (model.training_step - model.anm_warmup_steps) / model.anm_warmup_steps)
                 corruption_type = "adversarial" if curriculum_weight > 0.1 else "mixed"
         
         timestamp = datetime.now().isoformat()

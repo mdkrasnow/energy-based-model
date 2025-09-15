@@ -70,6 +70,8 @@ parser.add_argument('--anm-adversarial-steps', type=int, default=3,
                    help='Number of adversarial optimization steps')
 parser.add_argument('--anm-distance-penalty', type=float, default=0.1,
                    help='Weight for distance penalty in adversarial loss')
+parser.add_argument('--train-num-steps', type=int, default=1000,
+                   help='Total number of training steps')
 
 if __name__ == "__main__":
     FLAGS = parser.parse_args()
@@ -314,7 +316,7 @@ if __name__ == "__main__":
         train_batch_size = FLAGS.batch_size,
         validation_batch_size = validation_batch_size,
         train_lr = 1e-4,
-        train_num_steps = 1300000,         # total training steps
+        train_num_steps = FLAGS.train_num_steps,         # total training steps
         gradient_accumulate_every = 1,    # gradient accumulation steps
         ema_decay = 0.995,                # exponential moving average decay
         data_workers = FLAGS.data_workers,
