@@ -53,6 +53,13 @@ parser.add_argument('--evaluate', action='store_true', default=False)
 parser.add_argument('--latent', action='store_true', default=False)
 parser.add_argument('--ood', action='store_true', default=False)
 parser.add_argument('--baseline', action='store_true', default=False)
+# CSV logging arguments
+parser.add_argument('--save-csv-logs', action='store_true', default=False,
+                   help='Save training and validation metrics to CSV files')
+parser.add_argument('--csv-log-interval', type=int, default=100,
+                   help='Interval for logging training metrics to CSV')
+parser.add_argument('--csv-log-dir', type=str, default='./csv_logs',
+                   help='Directory to save CSV log files')
 
 # Adversarial Negative Mining arguments
 parser.add_argument('--use-adversarial-corruption', type=str2bool, default=False,
@@ -321,7 +328,10 @@ if __name__ == "__main__":
         save_and_sample_every = save_and_sample_every,
         evaluate_first = FLAGS.evaluate,  # run one evaluation first
         latent = FLAGS.latent,  # whether we are doing reasoning in the latent space
-        autoencode_model = autoencode_model
+        autoencode_model = autoencode_model,
+        save_csv_logs = FLAGS.save_csv_logs,
+        csv_log_interval = FLAGS.csv_log_interval,
+        csv_log_dir = FLAGS.csv_log_dir
     )
 
     if FLAGS.load_milestone is not None:

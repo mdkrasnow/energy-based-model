@@ -3,6 +3,8 @@ import sys
 import collections
 from multiprocessing import cpu_count
 from pathlib import Path
+import csv
+from datetime import datetime
 from random import random
 from functools import partial
 from collections import namedtuple
@@ -792,7 +794,10 @@ class Trainer1D(object):
         extra_validation_every_mul = 10,
         evaluate_first = False,
         latent = False,
-        autoencode_model = None
+        autoencode_model = None,
+        save_csv_logs = False,
+        csv_log_interval = 100,
+        csv_log_dir = './csv_logs'
     ):
         super().__init__()
 
@@ -874,12 +879,16 @@ class Trainer1D(object):
 
         # for logging results in a folder periodically
 
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
-
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
+
+        # CSV logging setup
+        self.save_csv_logs = save_csv_logs
+        self.csv_log_interval = csv_log_interval
+        if self.save_csv_logs and self.accelerator.is_main_process:
+            self.csv_log_dir = Path(csv_log_dir)
+            self.csv_log_dir.mkdir(exist_ok=True)
+            self._init_csv_logging()
 
         # step counter state
 
@@ -888,7 +897,52 @@ class Trainer1D(object):
         # prepare model, dataloader, optimizer with accelerator
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        
+        # Initialize EMA after model is prepared to ensure same device
+        if self.accelerator.is_main_process:
+            self.ema = EMA(self.model, beta = ema_decay, update_every = ema_update_every)
+            self.ema.to(self.device)
         self.evaluate_first = evaluate_first
+
+    def _init_csv_logging(self):
+        """Initialize CSV files for logging training and validation metrics"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Training metrics CSV
+        self.train_csv_path = self.csv_log_dir / f'training_metrics_{timestamp}.csv'
+        with open(self.train_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'epoch', 'total_loss', 'loss_denoise', 'loss_energy', 'loss_opt',
+                'data_time', 'nn_time', 'learning_rate', 'timestamp'
+            ])
+        
+        # Validation metrics CSV
+        self.val_csv_path = self.csv_log_dir / f'validation_metrics_{timestamp}.csv'
+        with open(self.val_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'milestone', 'dataset_name', 'metric_name', 'metric_value', 'timestamp'
+            ])
+        
+        # Energy landscape metrics CSV (for adversarial corruption analysis)
+        self.energy_csv_path = self.csv_log_dir / f'energy_metrics_{timestamp}.csv'
+        with open(self.energy_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'energy_pos_mean', 'energy_neg_mean', 'energy_diff', 
+                'curriculum_weight', 'corruption_type', 'timestamp'
+            ])
+    
+    def _log_to_csv(self, csv_path, row_data):
+        """Helper function to append data to CSV file"""
+        if self.save_csv_logs and self.accelerator.is_main_process:
+            try:
+                with open(csv_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row_data)
+            except Exception as e:
+                print(f"Warning: Failed to write to CSV {csv_path}: {e}")
 
     @property
     def device(self):
@@ -941,6 +995,7 @@ class Trainer1D(object):
         end_time = time.time()
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process, dynamic_ncols = True) as pbar:
 
+            epoch = 0
             while self.step < self.train_num_steps:
 
                 total_loss = 0.
@@ -983,6 +1038,24 @@ class Trainer1D(object):
                 nn_time = time.time() - end_time; end_time = time.time()
                 pbar.set_description(f'loss: {total_loss:.4f} loss_denoise: {loss_denoise:.4f} loss_energy: {loss_energy:.4f} loss_opt: {loss_opt:.4f} data_time: {data_time:.2f} nn_time: {nn_time:.2f}')
 
+                # Log training metrics to CSV
+                if self.save_csv_logs and self.step % self.csv_log_interval == 0:
+                    current_lr = self.opt.param_groups[0]['lr']
+                    timestamp = datetime.now().isoformat()
+                    
+                    train_row = [
+                        self.step, epoch, total_loss, loss_denoise.item(), 
+                        loss_energy.item(), loss_opt.item(), data_time, nn_time, 
+                        current_lr, timestamp
+                    ]
+                    self._log_to_csv(self.train_csv_path, train_row)
+                    
+                    # Log energy landscape metrics if available
+                    if hasattr(self.model.module, 'recent_energy_diffs'):
+                        recent_diffs = self.model.module.recent_energy_diffs
+                        if len(recent_diffs) > 0:
+                            self._log_energy_metrics(loss_energy.item(), recent_diffs[-1])
+
                 self.step += 1
                 if accelerator.is_main_process:
                     self.ema.update()
@@ -1000,8 +1073,28 @@ class Trainer1D(object):
 
 
                 pbar.update(1)
+                
+                # Update epoch counter (approximate)
+                if self.step % 1000 == 0:
+                    epoch += 1
 
         accelerator.print('training complete')
+        
+    def _log_energy_metrics(self, loss_energy, energy_diff):
+        """Log energy landscape specific metrics"""
+        curriculum_weight = 0.0
+        corruption_type = "standard"
+        
+        if hasattr(self.model.module, 'use_adversarial_corruption') and self.model.module.use_adversarial_corruption:
+            if hasattr(self.model.module, 'training_step') and self.model.module.training_step > self.model.module.anm_warmup_steps:
+                curriculum_weight = min(1.0, (self.model.module.training_step - self.model.module.anm_warmup_steps) / self.model.module.anm_warmup_steps)
+                corruption_type = "adversarial" if curriculum_weight > 0.1 else "mixed"
+        
+        timestamp = datetime.now().isoformat()
+        energy_row = [
+            self.step, 0, 0, energy_diff, curriculum_weight, corruption_type, timestamp
+        ]
+        self._log_to_csv(self.energy_csv_path, energy_row)
 
     def evaluate(self, device, milestone, inp=None, label=None, mask=None):
         print('Running Evaluation...')
@@ -1027,6 +1120,12 @@ class Trainer1D(object):
                     mse_error = (all_samples - label).pow(2).mean()
                     rows = [('mse_error', mse_error)]
                     print(tabulate(rows))
+                    
+                    # Log to CSV
+                    if self.save_csv_logs:
+                        timestamp = datetime.now().isoformat()
+                        val_row = [self.step, milestone, 'train_sample', 'mse_error', mse_error.item(), timestamp]
+                        self._log_to_csv(self.val_csv_path, val_row)
                 elif self.metric == 'bce':
                     assert len(all_samples_list) == 1
                     summary = binary_classification_accuracy_4(all_samples_list[0], label)
@@ -1037,6 +1136,13 @@ class Trainer1D(object):
                     summary = sudoku_accuracy(all_samples_list[0], label, mask)
                     rows = [[k, v] for k, v in summary.items()]
                     print(tabulate(rows))
+                    
+                    # Log to CSV
+                    if self.save_csv_logs:
+                        timestamp = datetime.now().isoformat()
+                        for metric_name, metric_value in summary.items():
+                            val_row = [self.step, milestone, 'train_sample', metric_name, metric_value, timestamp]
+                            self._log_to_csv(self.val_csv_path, val_row)
                 elif self.metric == 'sort':
                     assert len(all_samples_list) == 1
                     summary = binary_classification_accuracy_4(all_samples_list[0], label)
@@ -1146,6 +1252,13 @@ class Trainer1D(object):
             rows = [[k, v.avg] for k, v in meters.items()]
             print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (ID: {prefix})')
             print(tabulate(rows))
+            
+            # Log validation results to CSV
+            if self.save_csv_logs:
+                timestamp = datetime.now().isoformat()
+                for metric_name, meter in meters.items():
+                    val_row = [self.step, milestone, prefix, metric_name, meter.avg, timestamp]
+                    self._log_to_csv(self.val_csv_path, val_row)
 
 
 as_float = lambda x: float(x.item())
