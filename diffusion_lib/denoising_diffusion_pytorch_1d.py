@@ -1259,7 +1259,7 @@ class Trainer1D(object):
             if self.save_csv_logs:
                 timestamp = datetime.now().isoformat()
                 for metric_name, meter in meters.items():
-                    val_row = [self.step, milestone, prefix, metric_name, meter.avg, timestamp]
+                    val_row = [self.step, milestone, prefix, metric_name, float(meter.avg), timestamp]
                     self._log_to_csv(self.val_csv_path, val_row)
 
 
