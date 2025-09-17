@@ -16,6 +16,14 @@ from planning_dataset import PlanningDataset, PlanningDatasetOnline
 from sat_dataset import SATNetDataset, SudokuDataset, SudokuRRNDataset, SudokuRRNLatentDataset
 import torch
 
+# Import curriculum configuration with error handling
+try:
+    from curriculum_config import get_curriculum_by_name, DEFAULT_CURRICULUM
+    CURRICULUM_AVAILABLE = True
+except ImportError:
+    print("Warning: curriculum_config module not found. Curriculum features disabled.")
+    CURRICULUM_AVAILABLE = False
+
 import argparse
 
 try:
@@ -72,6 +80,21 @@ parser.add_argument('--anm-distance-penalty', type=float, default=0.1,
                    help='Weight for distance penalty in adversarial loss')
 parser.add_argument('--train-num-steps', type=int, default=1000,
                    help='Total number of training steps')
+
+# Curriculum configuration arguments
+parser.add_argument('--curriculum-config', type=str, default='default',
+                   choices=['default', 'aggressive', 'conservative', 'none'],
+                   help='Choice of curriculum configuration (default: default)')
+parser.add_argument('--disable-curriculum', type=str2bool, default=False,
+                   help='Boolean to force legacy behavior (default: False)')
+parser.add_argument('--enable-enhanced-metrics', type=str2bool, default=True,
+                   help='Boolean for enhanced metrics (default: True)')
+parser.add_argument('--metrics-patience', type=int, default=50,
+                   help='Early stopping patience (default: 50)')
+parser.add_argument('--metrics-window-size', type=int, default=1000,
+                   help='Metrics tracking window (default: 1000)')
+parser.add_argument('--save-comprehensive-metrics', type=str2bool, default=False,
+                   help='Save full metrics JSON (default: False)')
 
 if __name__ == "__main__":
     FLAGS = parser.parse_args()
@@ -280,6 +303,33 @@ if __name__ == "__main__":
     if FLAGS.dataset in ['shortest-path', 'shortest-path-1d']:
         kwargs['shortest_path'] = True
 
+    # Configure curriculum
+    curriculum_config = None
+    if CURRICULUM_AVAILABLE and not FLAGS.disable_curriculum and FLAGS.curriculum_config != 'none':
+        try:
+            curriculum_config = get_curriculum_by_name(FLAGS.curriculum_config)
+            # Update curriculum with actual training steps
+            curriculum_config.total_steps = FLAGS.train_num_steps
+            print(f"Using curriculum: {FLAGS.curriculum_config}")
+            print(f"Curriculum stages: {len(curriculum_config.stages)}")
+            for (start_pct, end_pct), stage in curriculum_config.stages.items():
+                start_step = int(start_pct * FLAGS.train_num_steps)
+                end_step = int(end_pct * FLAGS.train_num_steps)
+                print(f"  {stage.name}: steps {start_step}-{end_step} ({stage.focus})")
+        except Exception as e:
+            print(f"Warning: Failed to load curriculum '{FLAGS.curriculum_config}': {e}")
+            print("Falling back to legacy behavior")
+            curriculum_config = None
+    else:
+        if FLAGS.disable_curriculum:
+            print("Curriculum disabled by --disable-curriculum flag")
+        elif FLAGS.curriculum_config == 'none':
+            print("Curriculum disabled by --curriculum-config=none")
+        elif not CURRICULUM_AVAILABLE:
+            print("Curriculum not available (curriculum_config module not found)")
+        else:
+            print("Using legacy training behavior")
+
     diffusion = GaussianDiffusion1D(
         model,
         seq_length = 32,
@@ -293,6 +343,8 @@ if __name__ == "__main__":
         anm_warmup_steps = FLAGS.anm_warmup_steps,
         anm_adversarial_steps = FLAGS.anm_adversarial_steps,
         anm_distance_penalty = FLAGS.anm_distance_penalty,
+        curriculum_config = curriculum_config,
+        disable_curriculum = FLAGS.disable_curriculum or FLAGS.curriculum_config == 'none',
         **kwargs
     )
 
@@ -309,6 +361,16 @@ if __name__ == "__main__":
         autoencode_model.load_state_dict(model_ckpt)
     else:
         autoencode_model = None
+
+    # Print enhanced metrics configuration
+    if FLAGS.enable_enhanced_metrics:
+        print(f"Enhanced metrics enabled with patience={FLAGS.metrics_patience}, window_size={FLAGS.metrics_window_size}")
+        if FLAGS.save_comprehensive_metrics:
+            print("Comprehensive metrics will be saved (automatically every 5 checkpoints when enhanced metrics are enabled)")
+        else:
+            print("Comprehensive metrics saving disabled by --save-comprehensive-metrics=False")
+    else:
+        print("Enhanced metrics disabled")
 
     trainer = Trainer1D(
         diffusion,
@@ -333,7 +395,10 @@ if __name__ == "__main__":
         autoencode_model = autoencode_model,
         save_csv_logs = FLAGS.save_csv_logs,
         csv_log_interval = FLAGS.csv_log_interval,
-        csv_log_dir = FLAGS.csv_log_dir
+        csv_log_dir = FLAGS.csv_log_dir,
+        enable_enhanced_metrics = FLAGS.enable_enhanced_metrics,
+        metrics_patience = FLAGS.metrics_patience,
+        metrics_window_size = FLAGS.metrics_window_size
     )
 
     if FLAGS.load_milestone is not None:

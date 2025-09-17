@@ -457,7 +457,8 @@ class Inverse(data.Dataset):
         R = np.linalg.inv(R_corrupt)
         # R = np.linalg.solve(R_corrupt, np.eye(self.h))
 
-        return R_corrupt.flatten(), R.flatten()
+        # Convert to float32 to avoid MPS issues
+        return R_corrupt.flatten().astype(np.float32), R.flatten().astype(np.float32)
 
     def __len__(self):
         """Return the total number of images in the dataset."""
