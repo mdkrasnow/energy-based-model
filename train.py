@@ -87,14 +87,6 @@ parser.add_argument('--curriculum-config', type=str, default='default',
                    help='Choice of curriculum configuration (default: default)')
 parser.add_argument('--disable-curriculum', type=str2bool, default=False,
                    help='Boolean to force legacy behavior (default: False)')
-parser.add_argument('--enable-enhanced-metrics', type=str2bool, default=True,
-                   help='Boolean for enhanced metrics (default: True)')
-parser.add_argument('--metrics-patience', type=int, default=50,
-                   help='Early stopping patience (default: 50)')
-parser.add_argument('--metrics-window-size', type=int, default=1000,
-                   help='Metrics tracking window (default: 1000)')
-parser.add_argument('--save-comprehensive-metrics', type=str2bool, default=False,
-                   help='Save full metrics JSON (default: False)')
 
 if __name__ == "__main__":
     FLAGS = parser.parse_args()
@@ -113,6 +105,7 @@ if __name__ == "__main__":
         dataset = Inverse("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = dataset
         metric = 'mse'
+        save_and_sample_every = 50  # Lower interval for short training runs
     elif FLAGS.dataset == "lowrank":
         dataset = LowRankDataset("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = dataset
@@ -362,19 +355,11 @@ if __name__ == "__main__":
     else:
         autoencode_model = None
 
-    # Print enhanced metrics configuration
-    if FLAGS.enable_enhanced_metrics:
-        print(f"Enhanced metrics enabled with patience={FLAGS.metrics_patience}, window_size={FLAGS.metrics_window_size}")
-        if FLAGS.save_comprehensive_metrics:
-            print("Comprehensive metrics will be saved (automatically every 5 checkpoints when enhanced metrics are enabled)")
-        else:
-            print("Comprehensive metrics saving disabled by --save-comprehensive-metrics=False")
-    else:
-        print("Enhanced metrics disabled")
 
     trainer = Trainer1D(
         diffusion,
         dataset,
+        dataset_name = FLAGS.dataset,  # Pass dataset name for accuracy computation
         train_batch_size = FLAGS.batch_size,
         validation_batch_size = validation_batch_size,
         train_lr = 1e-4,
@@ -395,10 +380,7 @@ if __name__ == "__main__":
         autoencode_model = autoencode_model,
         save_csv_logs = FLAGS.save_csv_logs,
         csv_log_interval = FLAGS.csv_log_interval,
-        csv_log_dir = FLAGS.csv_log_dir,
-        enable_enhanced_metrics = FLAGS.enable_enhanced_metrics,
-        metrics_patience = FLAGS.metrics_patience,
-        metrics_window_size = FLAGS.metrics_window_size
+        csv_log_dir = FLAGS.csv_log_dir
     )
 
     if FLAGS.load_milestone is not None:

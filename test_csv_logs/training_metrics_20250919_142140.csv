@@ -1,0 +1,2 @@
+step,epoch,total_loss,loss_denoise,loss_energy,loss_opt,data_time,nn_time,learning_rate,timestamp
+0,0,0.9929734468460083,0.9929734468460083,-1,-1,4.278977870941162,0.6689448356628418,0.0001,2025-09-19T14:21:45.719649

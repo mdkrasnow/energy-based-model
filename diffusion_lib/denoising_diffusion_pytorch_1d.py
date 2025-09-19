@@ -29,7 +29,7 @@ import numpy as np
 
 # Import curriculum configuration system
 from curriculum_config import CurriculumConfig, DEFAULT_CURRICULUM
-from metrics_tracker import CurriculumMetricsTracker
+# from metrics_tracker import CurriculumMetricsTracker  # Removed enhanced metrics
 
 
 def _custom_exception_hook(type, value, tb):
@@ -1401,9 +1401,7 @@ class Trainer1D(object):
         save_csv_logs = False,
         csv_log_interval = 100,
         csv_log_dir = './csv_logs',
-        enable_enhanced_metrics = True,
-        metrics_patience = 50,
-        metrics_window_size = 1000
+        dataset_name = None  # Dataset name for task-specific accuracy
     ):
         super().__init__()
 
@@ -1448,6 +1446,7 @@ class Trainer1D(object):
         # Evaluation metric.
         self.metric = metric
         self.data_workers = data_workers
+        self.dataset = dataset_name  # Store dataset name for accuracy computation
 
         if self.data_workers is None:
             # Use a conservative default to avoid multiprocessing issues, especially on macOS
@@ -1498,15 +1497,8 @@ class Trainer1D(object):
             self.csv_log_dir.mkdir(exist_ok=True)
             self._init_csv_logging()
         
-        # Enhanced metrics tracking
-        self.enable_enhanced_metrics = enable_enhanced_metrics
+        # Metrics tracking disabled
         self.metrics_tracker = None
-        if self.enable_enhanced_metrics and self.accelerator.is_main_process:
-            self.metrics_tracker = CurriculumMetricsTracker(
-                window_size=metrics_window_size,
-                patience=metrics_patience
-            )
-            print(f"📊 Enhanced metrics tracking enabled (window_size={metrics_window_size}, patience={metrics_patience})")
 
         # step counter state
 
@@ -1654,8 +1646,8 @@ class Trainer1D(object):
     
     def _save_comprehensive_metrics(self):
         """Save comprehensive metrics dictionary to file"""
-        if not self.enable_enhanced_metrics or not self.accelerator.is_main_process:
-            return
+        # Skip metrics tracking
+        return
             
         try:
             import json
@@ -1716,9 +1708,7 @@ class Trainer1D(object):
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
         
-        # Reset metrics tracker when loading checkpoint
-        if self.enable_enhanced_metrics and self.accelerator.is_main_process:
-            print("🔄 Resetting metrics tracker for resumed training")
+        # Metrics tracking disabled
 
     def train(self):
         accelerator = self.accelerator
@@ -1778,74 +1768,32 @@ class Trainer1D(object):
                 accelerator.wait_for_everyone()
 
                 nn_time = time.time() - end_time; end_time = time.time()
-                pbar.set_description(f'loss: {total_loss:.4f} loss_denoise: {loss_denoise:.4f} loss_energy: {loss_energy:.4f} loss_opt: {loss_opt:.4f} data_time: {data_time:.2f} nn_time: {nn_time:.2f}')
+                
+                # Handle case where loss_energy and loss_opt might be -1 (integers)
+                loss_energy_display = loss_energy if not hasattr(loss_energy, 'item') else loss_energy.item()
+                loss_opt_display = loss_opt if not hasattr(loss_opt, 'item') else loss_opt.item()
+                
+                pbar.set_description(f'loss: {total_loss:.4f} loss_denoise: {loss_denoise:.4f} loss_energy: {loss_energy_display:.4f} loss_opt: {loss_opt_display:.4f} data_time: {data_time:.2f} nn_time: {nn_time:.2f}')
 
                 # Enhanced metrics tracking and logging
                 if self.step % self.csv_log_interval == 0:
                     # Get model reference for curriculum info
                     model = self.model.module if hasattr(self.model, 'module') else self.model
                     
-                    # Update metrics tracker if enabled
-                    if self.enable_enhanced_metrics and self.accelerator.is_main_process and self.metrics_tracker is not None:
-                        # Update training metrics
-                        train_metrics = {
-                            'loss': total_loss,
-                            'loss_denoise': loss_denoise.item(),
-                            'loss_energy': loss_energy.item(),
-                            'loss_opt': loss_opt.item()
-                        }
-                        self.metrics_tracker.update_training_metrics(self.step, train_metrics)
-                        
-                        # Update energy metrics if available
-                        if hasattr(model, 'recent_energy_diffs') and len(model.recent_energy_diffs) > 0:
-                            # Estimate positive and negative energies from the energy loss
-                            energy_diff = model.recent_energy_diffs[-1]
-                            pos_energy = loss_energy.item() / 2  # Approximate
-                            neg_energy = pos_energy + energy_diff
-                            self.metrics_tracker.update_energy_metrics(
-                                self.step, pos_energy, neg_energy, energy_diff=energy_diff
-                            )
-                        
-                        # Update curriculum metrics if curriculum is enabled
-                        if hasattr(model, 'get_curriculum_info_for_metrics'):
-                            # Use cached version for performance
-                            curriculum_info = model.get_curriculum_info_for_metrics()
-                        elif hasattr(model, 'get_curriculum_info'):
-                            curriculum_info = model.get_curriculum_info()
-                            if curriculum_info.get('curriculum_enabled', False):
-                                # Extract corruption type from recent history
-                                corruption_type = 'unknown'
-                                if hasattr(model, 'corruption_type_history') and model.corruption_type_history:
-                                    corruption_type = model.corruption_type_history[-1]
-                                
-                                self.metrics_tracker.update_curriculum_metrics(
-                                    self.step,
-                                    curriculum_info.get('current_stage', 'unknown'),
-                                    corruption_type,
-                                    curriculum_info.get('current_epsilon', 0.0),
-                                    curriculum_info.get('temperature', 1.0)
-                                )
-                                
-                                # Log curriculum metrics to CSV
-                                self._log_curriculum_metrics(curriculum_info)
-                        
-                        # Check and log overfitting signals
-                        overfitting_check = self.metrics_tracker.check_overfitting_signals()
-                        self._log_overfitting_metrics(overfitting_check)
-                        
-                        # Print warnings if any
-                        warnings = self.metrics_tracker.get_warning_messages()
-                        for warning in warnings:
-                            print(f"⚠️  {warning}")
+                    # Metrics tracking disabled
                     
                     # CSV logging (original functionality preserved)
                     if self.save_csv_logs:
                         current_lr = self.opt.param_groups[0]['lr']
                         timestamp = datetime.now().isoformat()
                         
+                        # Handle case where loss_energy and loss_opt might be -1 (integers)
+                        loss_energy_val = loss_energy.item() if hasattr(loss_energy, 'item') else loss_energy
+                        loss_opt_val = loss_opt.item() if hasattr(loss_opt, 'item') else loss_opt
+                        
                         train_row = [
                             self.step, epoch, total_loss, loss_denoise.item(), 
-                            loss_energy.item(), loss_opt.item(), data_time, nn_time, 
+                            loss_energy_val, loss_opt_val, data_time, nn_time, 
                             current_lr, timestamp
                         ]
                         self._log_to_csv(self.train_csv_path, train_row)
@@ -1857,26 +1805,9 @@ class Trainer1D(object):
                                 self._log_energy_metrics(loss_energy.item(), recent_diffs[-1])
                 
                 # Periodic comprehensive reporting (every 1000 steps)
-                if self.enable_enhanced_metrics and self.accelerator.is_main_process and self.metrics_tracker is not None and self.step % 1000 == 0 and self.step > 0:
-                    print("\n" + "="*50)
-                    print(self.metrics_tracker.get_summary_report())
-                    print("="*50 + "\n")
+                # Metrics tracking disabled
 
-                # Track gradient norms for enhanced metrics
-                if self.enable_enhanced_metrics and self.accelerator.is_main_process and self.metrics_tracker is not None:
-                    # Only calculate gradient norm when we're actually going to log it
-                    if self.step % self.csv_log_interval == 0:
-                        total_norm = 0.0
-                        for p in self.model.parameters():
-                            if p.grad is not None:
-                                param_norm = p.grad.data.norm(2)
-                                total_norm += param_norm.item() ** 2
-                        total_norm = total_norm ** (1. / 2)
-                        
-                        # Update gradient norm in metrics tracker
-                        self.metrics_tracker.update_training_metrics(
-                            self.step, {'gradient_norm': total_norm}
-                        )
+                # Metrics tracking disabled
 
                 self.step += 1
                 if accelerator.is_main_process:
@@ -1888,9 +1819,7 @@ class Trainer1D(object):
 
                         self.save(milestone)
                         
-                        # Save comprehensive metrics periodically (every few checkpoints)
-                        if self.enable_enhanced_metrics and self.metrics_tracker is not None and milestone % 5 == 0:
-                            self._save_comprehensive_metrics()
+                        # Metrics tracking disabled
 
                         if self.latent:
                             self.evaluate(device, milestone, inp=inp, label=label_gt, mask=mask_latent)
@@ -1944,15 +1873,30 @@ class Trainer1D(object):
                 print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (Train)')
                 if self.metric == 'mse':
                     all_samples = torch.cat(all_samples_list, dim = 0)
-                    mse_error = (all_samples - label).pow(2).mean()
-                    rows = [('mse_error', mse_error)]
-                    print(tabulate(rows))
                     
-                    # Log to CSV
-                    if self.save_csv_logs:
-                        timestamp = datetime.now().isoformat()
-                        val_row = [self.step, milestone, 'train_sample', 'mse_error', mse_error.item(), timestamp]
-                        self._log_to_csv(self.val_csv_path, val_row)
+                    # Compute inverse accuracy for inverse task
+                    if self.dataset == 'inverse':
+                        accuracy_metrics = inverse_accuracy(all_samples, inp, label)
+                        rows = [[k, v] for k, v in accuracy_metrics.items()]
+                        print(tabulate(rows))
+                        
+                        # Log all metrics to CSV
+                        if self.save_csv_logs:
+                            timestamp = datetime.now().isoformat()
+                            for metric_name, metric_value in accuracy_metrics.items():
+                                val_row = [self.step, milestone, 'train_sample', metric_name, metric_value, timestamp]
+                                self._log_to_csv(self.val_csv_path, val_row)
+                    else:
+                        # Regular MSE for other tasks
+                        mse_error = (all_samples - label).pow(2).mean()
+                        rows = [('mse_error', mse_error)]
+                        print(tabulate(rows))
+                        
+                        # Log to CSV
+                        if self.save_csv_logs:
+                            timestamp = datetime.now().isoformat()
+                            val_row = [self.step, milestone, 'train_sample', 'mse_error', mse_error.item(), timestamp]
+                            self._log_to_csv(self.val_csv_path, val_row)
                 elif self.metric == 'bce':
                     assert len(all_samples_list) == 1
                     summary = binary_classification_accuracy_4(all_samples_list[0], label)
@@ -2062,9 +2006,15 @@ class Trainer1D(object):
                     if i > 20:
                         break
                 elif self.metric == 'mse':
-                    # all_samples = torch.cat(all_samples_list, dim = 0)
-                    mse_error = (samples - label).pow(2).mean()
-                    meters['mse'].update(mse_error, n=inp.size(0))
+                    # Compute inverse accuracy for inverse task
+                    if self.dataset == 'inverse':
+                        accuracy_metrics = inverse_accuracy(samples, inp, label)
+                        for k, v in accuracy_metrics.items():
+                            meters[k].update(v, n=inp.size(0))
+                    else:
+                        # Regular MSE for other tasks
+                        mse_error = (samples - label).pow(2).mean()
+                        meters['mse'].update(mse_error, n=inp.size(0))
                     if i > 20:
                         break
                 elif self.metric == 'bce':
@@ -2080,30 +2030,7 @@ class Trainer1D(object):
             print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (ID: {prefix})')
             print(tabulate(rows))
             
-            # Enhanced validation logging with metrics tracker
-            if self.enable_enhanced_metrics and self.accelerator.is_main_process and self.metrics_tracker is not None:
-                # Update validation metrics in tracker
-                val_metrics = {k: float(v.avg) for k, v in meters.items()}
-                self.metrics_tracker.update_validation_metrics(self.step, val_metrics)
-                
-                # Log robustness metrics if accuracy is available
-                if 'accuracy' in val_metrics:
-                    clean_acc = val_metrics['accuracy']
-                    # For adversarial accuracy, check if there's a specific adversarial metric
-                    adv_acc = val_metrics.get('adversarial_accuracy', None)
-                    attack_success = val_metrics.get('attack_success_rate', None)
-                    
-                    self._log_robustness_metrics(clean_acc, adv_acc, attack_success)
-                    
-                    # Update robustness metrics in tracker if adversarial data is available
-                    if adv_acc is not None:
-                        self.metrics_tracker.update_robustness_metrics(
-                            self.step, clean_acc, adv_acc, attack_success or 0.0
-                        )
-                
-                # Check for early stopping signals
-                if self.metrics_tracker.should_early_stop():
-                    print("🛑 Early stopping criterion met - consider halting training")
+            # Metrics tracking disabled
             
             # Log validation results to CSV (original functionality preserved)
             if self.save_csv_logs:
@@ -2300,6 +2227,48 @@ def sort_accuracy_2(pred: torch.Tensor, label: torch.Tensor, mask: torch.Tensor,
         'element_accuracy' + name: as_float(element_correct),
         'array_accuracy' + name: as_float(array_correct),
         'first_action_accuracy' + name: as_float(first_action_correct)
+    }
+
+
+@torch.no_grad()
+def inverse_accuracy(pred: torch.Tensor, inp: torch.Tensor, label: torch.Tensor) -> dict[str, float]:
+    """Calculate accuracy metrics for matrix inverse task.
+    
+    Args:
+        pred: Predicted inverse matrices (flattened)
+        inp: Input matrices to be inverted (flattened)
+        label: True inverse matrices (flattened)
+    
+    Returns:
+        Dictionary with accuracy metrics
+    """
+    batch_size = pred.shape[0]
+    rank = int(np.sqrt(pred.shape[1]))
+    
+    # Reshape to matrices
+    pred_mat = pred.view(batch_size, rank, rank)
+    input_mat = inp.view(batch_size, rank, rank)
+    true_mat = label.view(batch_size, rank, rank)
+    
+    # Key metric: pred @ input should be Identity
+    product = torch.bmm(pred_mat, input_mat)
+    identity = torch.eye(rank, device=pred.device).unsqueeze(0).expand(batch_size, -1, -1)
+    
+    # Compute metrics
+    identity_error = (product - identity).pow(2).mean(dim=(1,2))  # Per-sample error
+    mse = (pred - label).pow(2).mean()
+    relative_error = (pred - label).pow(2).sum(dim=1) / (label.pow(2).sum(dim=1) + 1e-8)
+    
+    # Task success: product is close to identity (threshold-based)
+    threshold = 0.1
+    task_success = (identity_error < threshold).float()
+    
+    return {
+        'mse': as_float(mse),
+        'identity_error': as_float(identity_error.mean()),
+        'relative_error': as_float(relative_error.mean()),
+        'accuracy_pct': as_float(task_success.mean() * 100),
+        'mean_abs_error': as_float((pred - label).abs().mean())
     }
 
 
