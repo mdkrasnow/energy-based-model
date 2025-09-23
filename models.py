@@ -686,7 +686,7 @@ class GNNConv1DEBMV2(nn.Module):
 
     def forward(self, inp, out, t):
         # inp.shape == [B, N, N, inp_dim]
-        # out.shape == [B, T, N, out_dim]
+        # out.shape == [B, T, N, out_dim] or [B, N, N] for connectivity dataset
 
         T, N = out.shape[1], out.shape[2]
         t_emb = self.time_mlp(t)

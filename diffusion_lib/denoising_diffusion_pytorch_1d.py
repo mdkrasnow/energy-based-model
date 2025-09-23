@@ -32,8 +32,8 @@ from curriculum_config import CurriculumConfig, DEFAULT_CURRICULUM
 # from metrics_tracker import CurriculumMetricsTracker  # Removed enhanced metrics
 
 # NEW: modularized curriculum + corruption
-from curriculum_runtime import CurriculumRuntime
-from adversarial_corruption import (
+from .curriculum_runtime import CurriculumRuntime
+from .adversarial_corruption import (
     enhanced_corruption_step_v2 as adv_enhanced_corruption_step_v2,
     enhanced_corruption_step_legacy as adv_enhanced_corruption_step_legacy,
 )

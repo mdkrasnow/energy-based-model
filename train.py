@@ -318,10 +318,6 @@ if __name__ == "__main__":
         supervise_energy_landscape = FLAGS.supervise_energy_landscape,
         use_innerloop_opt = FLAGS.use_innerloop_opt,
         show_inference_tqdm = False,
-        use_adversarial_corruption = FLAGS.use_adversarial_corruption,
-        anm_warmup_steps = FLAGS.anm_warmup_steps,
-        anm_adversarial_steps = FLAGS.anm_adversarial_steps,
-        anm_distance_penalty = FLAGS.anm_distance_penalty,
         curriculum_config = curriculum_config,
         disable_curriculum = FLAGS.disable_curriculum or FLAGS.curriculum_config == 'none',
         **kwargs
