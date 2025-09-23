@@ -68,16 +68,7 @@ parser.add_argument('--csv-log-interval', type=int, default=100,
                    help='Interval for logging training metrics to CSV')
 parser.add_argument('--csv-log-dir', type=str, default='./csv_logs',
                    help='Directory to save CSV log files')
-
-# Adversarial Negative Mining arguments
-parser.add_argument('--use-adversarial-corruption', type=str2bool, default=False,
-                   help='Use adversarial corruption for enhanced negative mining')
-parser.add_argument('--anm-warmup-steps', type=int, default=5000,
-                   help='Steps before adversarial corruption begins')
-parser.add_argument('--anm-adversarial-steps', type=int, default=3,
-                   help='Number of adversarial optimization steps')
-parser.add_argument('--anm-distance-penalty', type=float, default=0.1,
-                   help='Weight for distance penalty in adversarial loss')
+                   
 parser.add_argument('--train-num-steps', type=int, default=1000,
                    help='Total number of training steps')
 
@@ -87,6 +78,7 @@ parser.add_argument('--curriculum-config', type=str, default='default',
                    help='Choice of curriculum configuration (default: default)')
 parser.add_argument('--disable-curriculum', type=str2bool, default=False,
                    help='Boolean to force legacy behavior (default: False)')
+
 
 if __name__ == "__main__":
     FLAGS = parser.parse_args()

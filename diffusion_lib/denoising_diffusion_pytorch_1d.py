@@ -31,6 +31,13 @@ import numpy as np
 from curriculum_config import CurriculumConfig, DEFAULT_CURRICULUM
 # from metrics_tracker import CurriculumMetricsTracker  # Removed enhanced metrics
 
+# NEW: modularized curriculum + corruption
+from curriculum_runtime import CurriculumRuntime
+from adversarial_corruption import (
+    enhanced_corruption_step_v2 as adv_enhanced_corruption_step_v2,
+    enhanced_corruption_step_legacy as adv_enhanced_corruption_step_legacy,
+)
+
 
 def _custom_exception_hook(type, value, tb):
     if hasattr(sys, 'ps1') or not sys.stderr.isatty():
@@ -164,206 +171,7 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     return torch.clip(betas, 0, 0.999)
 
 
-class ValidationGatedCurriculum:
-    """
-    Helper class for managing validation-based curriculum gating.
-    
-    This class tracks validation performance and makes decisions about
-    curriculum progression, intensity adjustments, and rollbacks.
-    
-    Key Features:
-    - Tracks validation loss and accuracy with exponential moving averages
-    - Maintains stage-specific performance baselines
-    - Detects performance degradation beyond configurable thresholds
-    - Automatically adjusts curriculum intensity (0.1x to 2.0x multiplier)
-    - Supports curriculum rollback for severe performance drops
-    - Provides detailed logging of all adjustments and decisions
-    
-    Integration:
-    - Automatically initialized when curriculum_config is provided
-    - Integrates with get_current_curriculum_params() for seamless operation
-    - Can be disabled via curriculum_config.enable_validation_gating = False
-    - Thread-safe for concurrent validation updates
-    """
-    
-    def __init__(self, config: CurriculumConfig, window_size: int = 10):
-        """
-        Initialize validation gating system.
-        
-        Args:
-            config: CurriculumConfig with gating parameters
-            window_size: Number of recent validation scores to track
-        """
-        self.config = config
-        self.window_size = window_size
-        
-        # Validation performance tracking
-        self.val_loss_history = collections.deque(maxlen=window_size)
-        self.val_accuracy_history = collections.deque(maxlen=window_size)
-        self.val_loss_ema = None
-        self.val_accuracy_ema = None
-        
-        # Stage-specific baselines
-        self.stage_baselines = {}  # stage_name -> {'loss': float, 'accuracy': float}
-        self.current_stage_baseline = None
-        
-        # Curriculum adjustment state
-        self.intensity_multiplier = 1.0  # Current intensity adjustment (0.0 to 2.0)
-        self.consecutive_degradations = 0
-        self.last_adjustment_step = 0
-        self.rollback_count = 0
-        
-        # Performance tracking
-        self.performance_trend = "stable"  # "improving", "stable", "degrading"
-        self.adjustment_history = []  # List of (step, adjustment_type, reason)
-        
-    def update_validation_metrics(self, val_loss: float, val_accuracy: float, step: int):
-        """
-        Update validation metrics with exponential moving average.
-        
-        Args:
-            val_loss: Current validation loss
-            val_accuracy: Current validation accuracy
-            step: Current training step
-        """
-        # Update raw history
-        self.val_loss_history.append(val_loss)
-        self.val_accuracy_history.append(val_accuracy)
-        
-        # Update exponential moving averages (alpha = 0.1 for smoothing)
-        alpha = 0.1
-        if self.val_loss_ema is None:
-            self.val_loss_ema = val_loss
-            self.val_accuracy_ema = val_accuracy
-        else:
-            self.val_loss_ema = alpha * val_loss + (1 - alpha) * self.val_loss_ema
-            self.val_accuracy_ema = alpha * val_accuracy + (1 - alpha) * self.val_accuracy_ema
-    
-    def set_stage_baseline(self, stage_name: str, force_update: bool = False):
-        """
-        Set baseline performance for a curriculum stage.
-        
-        Args:
-            stage_name: Name of the curriculum stage
-            force_update: Whether to update existing baseline
-        """
-        if (stage_name not in self.stage_baselines or force_update) and self.val_loss_ema is not None:
-            self.stage_baselines[stage_name] = {
-                'loss': self.val_loss_ema,
-                'accuracy': self.val_accuracy_ema
-            }
-            self.current_stage_baseline = self.stage_baselines[stage_name]
-    
-    def detect_performance_degradation(self) -> tuple[bool, str]:
-        """
-        Detect if validation performance has degraded significantly.
-        
-        Returns:
-            Tuple of (is_degraded, reason)
-        """
-        if (len(self.val_loss_history) < 3 or 
-            self.current_stage_baseline is None or
-            self.val_loss_ema is None):
-            return False, "insufficient_data"
-        
-        baseline_loss = self.current_stage_baseline['loss']
-        baseline_accuracy = self.current_stage_baseline['accuracy']
-        
-        # Check loss degradation (increase beyond threshold)
-        loss_increase = (self.val_loss_ema - baseline_loss) / baseline_loss
-        if loss_increase > self.config.validation_threshold:
-            return True, f"loss_degradation_{loss_increase:.3f}"
-        
-        # Check accuracy degradation (decrease beyond threshold)
-        accuracy_decrease = (baseline_accuracy - self.val_accuracy_ema) / baseline_accuracy
-        if accuracy_decrease > self.config.validation_threshold:
-            return True, f"accuracy_degradation_{accuracy_decrease:.3f}"
-        
-        return False, "performance_stable"
-    
-    def should_adjust_curriculum(self, step: int) -> tuple[bool, str, str]:
-        """
-        Determine if curriculum should be adjusted based on validation performance.
-        
-        Args:
-            step: Current training step
-            
-        Returns:
-            Tuple of (should_adjust, adjustment_type, reason)
-            adjustment_type: "reduce_intensity", "increase_intensity", "rollback", "none"
-        """
-        if not self.config.enable_validation_gating:
-            return False, "none", "gating_disabled"
-        
-        # Don't adjust too frequently (minimum 1000 steps between adjustments)
-        if step - self.last_adjustment_step < 1000:
-            return False, "none", "too_recent"
-        
-        # Check for performance degradation
-        is_degraded, degradation_reason = self.detect_performance_degradation()
-        
-        if is_degraded:
-            self.consecutive_degradations += 1
-            
-            # If multiple consecutive degradations, consider rollback
-            if self.consecutive_degradations >= 3:
-                return True, "rollback", f"consecutive_degradations_{degradation_reason}"
-            else:
-                return True, "reduce_intensity", degradation_reason
-        else:
-            self.consecutive_degradations = 0
-            
-            # Check if performance is improving faster than expected
-            if (len(self.val_loss_history) >= 5 and 
-                self.val_loss_ema < self.current_stage_baseline['loss'] * 0.95):
-                # Performance is significantly better than baseline
-                return True, "increase_intensity", "performance_exceeding_baseline"
-        
-        return False, "none", "no_adjustment_needed"
-    
-    def adjust_intensity(self, adjustment_type: str, step: int, reason: str) -> float:
-        """
-        Adjust curriculum intensity based on validation performance.
-        
-        Args:
-            adjustment_type: Type of adjustment to make
-            step: Current training step
-            reason: Reason for adjustment
-            
-        Returns:
-            New intensity multiplier
-        """
-        old_intensity = self.intensity_multiplier
-        
-        if adjustment_type == "reduce_intensity":
-            self.intensity_multiplier = max(0.1, self.intensity_multiplier * 0.7)
-        elif adjustment_type == "increase_intensity":
-            self.intensity_multiplier = min(2.0, self.intensity_multiplier * 1.2)
-        elif adjustment_type == "rollback":
-            self.intensity_multiplier = max(0.1, self.intensity_multiplier * 0.5)
-            self.rollback_count += 1
-        
-        # Record adjustment
-        self.adjustment_history.append((step, adjustment_type, reason, old_intensity, self.intensity_multiplier))
-        self.last_adjustment_step = step
-        
-        return self.intensity_multiplier
-    
-    def get_adjustment_log(self) -> str:
-        """Get a formatted log of recent curriculum adjustments."""
-        if not self.adjustment_history:
-            return "No curriculum adjustments made."
-        
-        recent_adjustments = self.adjustment_history[-5:]  # Last 5 adjustments
-        log_lines = ["Recent curriculum adjustments:"]
-        
-        for step, adj_type, reason, old_intensity, new_intensity in recent_adjustments:
-            log_lines.append(
-                f"  Step {step}: {adj_type} ({reason}) - "
-                f"intensity {old_intensity:.3f} -> {new_intensity:.3f}"
-            )
-        
-        return "\n".join(log_lines)
+## moved to curriculum_runtime.ValidationGatedCurriculum
 
 
 class GaussianDiffusion1D(nn.Module):
@@ -451,16 +259,19 @@ class GaussianDiffusion1D(nn.Module):
         else:
             self.curriculum_config = curriculum_config
             
-        # Initialize validation gating system
-        self.validation_gating = None
+        # Initialize curriculum runtime
+        self.curriculum_runtime = None
         if self.curriculum_config is not None:
-            self.validation_gating = ValidationGatedCurriculum(self.curriculum_config)
+            self.curriculum_runtime = CurriculumRuntime(
+                curriculum_config=self.curriculum_config,
+                anm_distance_penalty=self.anm_distance_penalty,
+                warmup_steps=self.anm_warmup_steps,
+                use_adversarial_corruption=self.use_adversarial_corruption
+            )
             
         # Training state tracking
         self.training_step = 0
         self.recent_energy_diffs = []
-        self.current_stage = None
-        self.stage_transition_step = 0
         self.corruption_type_history = []
         
         # Track corruption type counts for logging
@@ -470,10 +281,6 @@ class GaussianDiffusion1D(nn.Module):
         self._curriculum_info_cache = None
         self._curriculum_info_cache_step = -1
         self._cache_update_interval = 10  # Update cache every N steps
-        
-        # Validation gating state tracking
-        self.effective_step = 0  # Step adjusted for rollbacks
-        self.curriculum_rollback_target = None  # Target step for rollback
 
         # sampling related parameters
 
@@ -671,320 +478,73 @@ class GaussianDiffusion1D(nn.Module):
 
         return img
 
-    def get_current_curriculum_params(self, step):
-        """Get current curriculum stage and parameters with validation gating."""
-        # Use effective step for rollback scenarios
-        effective_step = step
-        if self.curriculum_rollback_target is not None:
-            effective_step = min(step, self.curriculum_rollback_target + (step - self.stage_transition_step))
-            # Clear rollback once we've caught up
-            if step >= self.curriculum_rollback_target + self.curriculum_config.rollback_steps:
-                self.curriculum_rollback_target = None
-        
-        # Get base curriculum parameters
-        stage = self.curriculum_config.get_stage(effective_step)
-        base_epsilon = self.curriculum_config.get_smooth_epsilon(effective_step, self.anm_distance_penalty * 10)
-        
-        # Apply validation gating intensity adjustment
-        intensity_multiplier = 1.0
-        if self.validation_gating is not None:
-            intensity_multiplier = self.validation_gating.intensity_multiplier
-            
-            # Check if we should adjust curriculum based on validation performance
-            should_adjust, adjustment_type, reason = self.should_adjust_curriculum()
-            if should_adjust:
-                if adjustment_type == "rollback":
-                    # Perform rollback
-                    self.rollback_curriculum()
-                    # Recalculate with new effective step
-                    effective_step = self.effective_step
-                    stage = self.curriculum_config.get_stage(effective_step)
-                    base_epsilon = self.curriculum_config.get_smooth_epsilon(effective_step, self.anm_distance_penalty * 10)
-                else:
-                    # Adjust intensity
-                    intensity_multiplier = self.adjust_curriculum_intensity(adjustment_type, reason)
-        
-        # Apply intensity adjustment to epsilon and stage ratios
-        adjusted_epsilon = base_epsilon * intensity_multiplier
-        
-        # Create adjusted stage with modified parameters for smooth transitions
-        if intensity_multiplier != 1.0:
-            from copy import copy
-            adjusted_stage = copy(stage)
-            
-            # Smooth intensity adjustments - when reducing intensity, increase clean ratio
-            if intensity_multiplier < 1.0:
-                # Increase clean ratio when reducing intensity
-                clean_boost = (1.0 - intensity_multiplier) * 0.3
-                adjusted_stage.clean_ratio = min(1.0, stage.clean_ratio + clean_boost)
-                adjusted_stage.adversarial_ratio = max(0.0, stage.adversarial_ratio - clean_boost * 0.7)
-                adjusted_stage.gaussian_ratio = max(0.0, stage.gaussian_ratio - clean_boost * 0.3)
-            # When increasing intensity, we keep original ratios but increase epsilon
-            
-            stage = adjusted_stage
-        
-        # Track stage transitions
-        if self.current_stage != stage.name:
-            old_stage = self.current_stage
-            self.current_stage = stage.name
-            self.stage_transition_step = step
-            
-            # Set new baseline for validation gating
-            if self.validation_gating is not None:
-                self.validation_gating.set_stage_baseline(self.current_stage, force_update=True)
-            
-            print(f"[Curriculum] Step {step}: Stage transition {old_stage} -> {stage.name} "
-                  f"(effective_step: {effective_step}, intensity: {intensity_multiplier:.3f})")
-            
-        return stage, adjusted_epsilon
+    def _get_current_curriculum_params(self, step):
+        """Delegate to CurriculumRuntime for current stage + epsilon."""
+        assert self.curriculum_runtime is not None, "Curriculum runtime is not initialized"
+        stage, epsilon = self.curriculum_runtime.get_params(step, base_distance_penalty=self.anm_distance_penalty)
+        return stage, epsilon
     
-    def _sample_corruption_type(self, stage):
-        """Sample corruption type based on curriculum stage ratios."""
-        rand_val = torch.rand(1).item()
-        
-        if rand_val < stage.clean_ratio:
-            corruption_type = 'clean'
-        elif rand_val < stage.clean_ratio + stage.adversarial_ratio:
-            corruption_type = 'adversarial' 
-        else:
-            corruption_type = 'gaussian'
-            
-        # Update counts for logging
-        self.corruption_type_counts[corruption_type] += 1
-        return corruption_type
-    
-    def _clean_corruption(self, x_start, t):
-        """Standard clean noise corruption - returns NOISED sample."""
-        noise = torch.randn_like(x_start)
-        # Return noised sample, matching the behavior of _standard_ired_corruption
-        return self.q_sample(x_start=x_start, t=t, noise=noise)
-    
-    def _gaussian_noise_corruption(self, x_start, t, scale=3.0):
-        """Gaussian noise corruption with scale - returns NOISED sample."""
-        noise = torch.randn_like(x_start)
-        # Return noised sample with scale, matching the behavior of _standard_ired_corruption
-        return self.q_sample(x_start=x_start, t=t, noise=scale * noise)
 
     # Validation gating methods
     def update_validation_performance(self, val_loss: float, val_accuracy: float = None):
-        """
-        Update validation performance metrics for curriculum gating.
-        
-        Args:
-            val_loss: Current validation loss
-            val_accuracy: Current validation accuracy (optional, defaults to 1-val_loss)
-        """
-        if self.validation_gating is None:
+        """Delegate to curriculum runtime (no-op if curriculum disabled)."""
+        if self.curriculum_runtime is None:
             return
-        
-        # Use 1-val_loss as accuracy approximation if not provided
-        if val_accuracy is None:
-            val_accuracy = max(0.0, 1.0 - val_loss)
-        
-        self.validation_gating.update_validation_metrics(val_loss, val_accuracy, self.training_step)
-        
-        # Set stage baseline if we've transitioned to a new stage
-        if self.current_stage is not None:
-            self.validation_gating.set_stage_baseline(self.current_stage)
+        self.curriculum_runtime.update_validation_performance(self.training_step, val_loss, val_accuracy)
     
     def should_adjust_curriculum(self) -> tuple[bool, str, str]:
-        """
-        Check if curriculum should be adjusted based on validation performance.
-        
-        Returns:
-            Tuple of (should_adjust, adjustment_type, reason)
-        """
-        if self.validation_gating is None:
-            return False, "none", "no_validation_gating"
-        
-        return self.validation_gating.should_adjust_curriculum(self.training_step)
+        if self.curriculum_runtime is None:
+            return (False, "none", "no_validation_gating")
+        return self.curriculum_runtime.should_adjust_curriculum(self.training_step)
     
     def adjust_curriculum_intensity(self, adjustment_type: str = None, reason: str = None) -> float:
-        """
-        Adjust curriculum intensity based on validation performance.
-        
-        Args:
-            adjustment_type: Type of adjustment (auto-determined if None)
-            reason: Reason for adjustment (auto-determined if None)
-            
-        Returns:
-            New intensity multiplier
-        """
-        if self.validation_gating is None:
+        if self.curriculum_runtime is None:
             return 1.0
-        
-        # Auto-determine adjustment if not specified
-        if adjustment_type is None:
-            should_adjust, adjustment_type, reason = self.should_adjust_curriculum()
-            if not should_adjust:
-                return self.validation_gating.intensity_multiplier
-        
-        old_intensity = self.validation_gating.intensity_multiplier
-        new_intensity = self.validation_gating.adjust_intensity(adjustment_type, self.training_step, reason)
-        
-        # Log the adjustment
-        if old_intensity != new_intensity:
-            print(f"[Curriculum Gating] Step {self.training_step}: {adjustment_type} - "
-                  f"intensity {old_intensity:.3f} -> {new_intensity:.3f} (reason: {reason})")
-        
-        return new_intensity
+        return self.curriculum_runtime.adjust_curriculum_intensity(self.training_step, adjustment_type, reason)
     
     def rollback_curriculum(self, rollback_steps: int = None) -> int:
-        """
-        Rollback curriculum to a previous stage if performance degrades.
-        
-        Args:
-            rollback_steps: Number of steps to rollback (uses config default if None)
-            
-        Returns:
-            New effective training step after rollback
-        """
-        if self.validation_gating is None:
+        if self.curriculum_runtime is None:
             return self.training_step
-        
-        if rollback_steps is None:
-            rollback_steps = self.curriculum_config.rollback_steps
-        
-        # Calculate rollback target
-        self.curriculum_rollback_target = max(0, self.training_step - rollback_steps)
-        self.effective_step = self.curriculum_rollback_target
-        
-        # Reset validation gating intensity and consecutive degradations
-        self.validation_gating.intensity_multiplier = 1.0
-        self.validation_gating.consecutive_degradations = 0
-        
-        print(f"[Curriculum Rollback] Step {self.training_step}: Rolling back {rollback_steps} steps "
-              f"to effective step {self.effective_step}")
-        
-        return self.effective_step
+        return self.curriculum_runtime.rollback_curriculum(self.training_step, rollback_steps)
 
     def enhanced_corruption_step_v2(self, inp, x_start, t, mask, data_cond, base_noise_scale=3.0):
-        """New curriculum-aware corruption method - returns noised samples."""
-        # Get current curriculum parameters
-        stage, epsilon = self.get_current_curriculum_params(self.training_step)
-        
-        # Sample corruption type based on curriculum ratios
-        corruption_type = self._sample_corruption_type(stage)
-        
-        # Store corruption type and parameters for use in p_losses
-        self._current_corruption_type = corruption_type
-        self._current_stage = stage
-        
-        # Apply the selected corruption type - all return noised samples
-        if corruption_type == 'clean':
-            x_corrupted = self._clean_corruption(x_start, t)
-        elif corruption_type == 'gaussian':
-            # Scale Gaussian noise by stage temperature for adaptive difficulty
-            noise_scale = base_noise_scale * (2.0 / max(stage.temperature, 1.0))
-            x_corrupted = self._gaussian_noise_corruption(x_start, t, noise_scale)
-        else:  # adversarial
-            x_corrupted = self._adversarial_corruption(inp, x_start, t, mask, data_cond, base_noise_scale, epsilon)
-        
-        # Note: All methods now return already-noised samples, matching _standard_ired_corruption
-        # No additional noising will be applied in p_losses
-        
+        """New curriculum-aware corruption method - returns noised samples (delegated)."""
+        stage, epsilon = self._get_current_curriculum_params(self.training_step)
+        corruption_type, x_corrupted = adv_enhanced_corruption_step_v2(
+            ops=self,
+            stage=stage,
+            epsilon=epsilon,
+            inp=inp,
+            x_start=x_start,
+            t=t,
+            mask=mask,
+            data_cond=data_cond,
+            base_noise_scale=base_noise_scale,
+        )
+        self.corruption_type_history.append(corruption_type)
+        if corruption_type in self.corruption_type_counts:
+            self.corruption_type_counts[corruption_type] += 1
         return x_corrupted
 
     def enhanced_corruption_step(self, inp, x_start, t, mask, data_cond, base_noise_scale=3.0):
-        """Enhanced adversarial corruption with curriculum learning (legacy method)
-        
-        This method maintains backward compatibility while integrating curriculum support.
-        Use enhanced_corruption_step_v2 for full curriculum features.
-        """
-        # Use new curriculum method if curriculum is configured and curriculum_config is not None
-        if hasattr(self, 'curriculum_config') and self.curriculum_config is not None:
+        """Legacy path when curriculum is disabled; otherwise defers to v2."""
+        if self.curriculum_config is not None:
             return self.enhanced_corruption_step_v2(inp, x_start, t, mask, data_cond, base_noise_scale)
-            
-        # Legacy behavior for backward compatibility (when curriculum_config is explicitly set to None)
-        # Note: training_step increment should be handled by caller to avoid double increment
-        
-        # Curriculum weight: 0 during warmup, then gradually increase
-        if self.training_step < self.anm_warmup_steps:
-            curriculum_weight = 0.0
-        else:
-            progress = (self.training_step - self.anm_warmup_steps) / max(self.anm_warmup_steps, 1)
-            curriculum_weight = min(1.0, progress)
-            
-            # Adapt based on recent energy landscape quality
-            if len(self.recent_energy_diffs) > 10:
-                quality_factor = np.mean(self.recent_energy_diffs[-10:])
-                curriculum_weight *= np.clip(quality_factor, 0.1, 1.0)
-        
-        # Use adversarial corruption with probability = curriculum_weight
-        if torch.rand(1).item() < curriculum_weight and self.use_adversarial_corruption:
-            return self._adversarial_corruption(inp, x_start, t, mask, data_cond, base_noise_scale, self.anm_distance_penalty)
-        else:
-            # Fallback to standard IRED corruption
-            return self._standard_ired_corruption(inp, x_start, t, mask, data_cond, base_noise_scale)
-
-    def _standard_ired_corruption(self, inp, x_start, t, mask, data_cond, base_noise_scale):
-        """Original IRED corruption mechanism (extracted from p_losses)"""
-        noise = torch.randn_like(x_start)
-        xmin_noise = self.q_sample(x_start = x_start, t = t, noise = base_noise_scale * noise)
-        
-        if mask is not None:
-            xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
-        
-        # Apply original opt_step with task-specific parameters
-        if self.sudoku:
-            step = 20
-        else:
-            step = 5
-            
-        xmin_noise = self.opt_step(inp, xmin_noise, t, mask, data_cond, step=step, sf=1.0)
-        return xmin_noise
-
-    def _adversarial_corruption(self, inp, x_start, t, mask, data_cond, base_noise_scale, epsilon=None):
-        """Enhanced corruption with distance penalty - optimizes in noisy space, returns clean"""
-        # Start with standard noise corruption in noisy space
-        noise = torch.randn_like(x_start)
-        xmin_noise = self.q_sample(x_start = x_start, t = t, noise = base_noise_scale * noise)
-        
-        if mask is not None:
-            xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
-        
-        xmin_noise.requires_grad_(True)
-        opt_step_size = extract(self.opt_step_size, t, xmin_noise.shape)
-        
-        # Enhanced adversarial steps with distance penalty
-        effective_epsilon = epsilon if epsilon is not None else self.anm_distance_penalty
-        
-        # Store the original noisy sample for reference
-        xmin_noise_orig = xmin_noise.clone().detach()
-        
-        for i in range(self.anm_adversarial_steps):
-            energy, grad = self.model(inp, xmin_noise, t, return_both=True)
-            
-            # Distance penalty prevents collapse to ground truth (in noisy space)
-            # Use original noisy sample as reference instead of clean x_start
-            distance_penalty = F.mse_loss(xmin_noise, xmin_noise_orig)
-            adaptive_penalty_weight = effective_epsilon * torch.clamp(1.0 / (distance_penalty + 1e-6), 0.1, 2.0)
-            
-            # Modified gradient: energy gradient - distance penalty gradient
-            penalty_grad = torch.autograd.grad(distance_penalty, xmin_noise, create_graph=False, retain_graph=True)[0]
-            modified_grad = grad - adaptive_penalty_weight * penalty_grad
-            
-            # Apply gradient step with decreasing step size
-            step_scale = 1.0 * (0.7 ** i)  # Decreasing step size for stability
-            xmin_noise = xmin_noise - opt_step_size * modified_grad * step_scale
-            
-            if mask is not None:
-                xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
-                
-            # Apply existing task-specific clipping
-            if self.continuous:
-                sf = 2.0
-            elif self.shortest_path:
-                sf = 0.1
-            else:
-                sf = 1.0
-                
-            max_val = extract(self.sqrt_alphas_cumprod, t, xmin_noise.shape) * sf
-            xmin_noise = torch.clamp(xmin_noise, -max_val, max_val)
-            xmin_noise.requires_grad_(True)
-        
-        # Return the optimized noisy sample directly, matching _standard_ired_corruption behavior
-        return xmin_noise.detach()
+        _, x_corrupted = adv_enhanced_corruption_step_legacy(
+            ops=self,
+            use_adversarial_corruption=self.use_adversarial_corruption,
+            training_step=self.training_step,
+            anm_warmup_steps=self.anm_warmup_steps,
+            anm_distance_penalty=self.anm_distance_penalty,
+            recent_energy_diffs=self.recent_energy_diffs,
+            inp=inp,
+            x_start=x_start,
+            t=t,
+            mask=mask,
+            data_cond=data_cond,
+            base_noise_scale=base_noise_scale,
+        )
+        return x_corrupted
 
     def get_curriculum_info_for_metrics(self):
         """Get cached curriculum info for metrics tracking (performance optimized)."""
@@ -1000,61 +560,53 @@ class GaussianDiffusion1D(nn.Module):
     
     def get_curriculum_info(self):
         """Get current curriculum information for logging and monitoring."""
-        if not hasattr(self, 'curriculum_config') or self.curriculum_config is None:
+        if self.curriculum_config is None:
             return {
                 'curriculum_enabled': False,
                 'current_step': self.training_step,
                 'legacy_warmup_phase': self.training_step < self.anm_warmup_steps
             }
-        
-        # For metrics, use simplified params without validation gating checks
-        # This avoids expensive computation on every call
+        # Cheap read-only view (no gating decisions)
         stage = self.curriculum_config.get_stage(self.training_step)
         epsilon = self.curriculum_config.get_smooth_epsilon(self.training_step, self.anm_distance_penalty * 10)
         progress = self.training_step / self.curriculum_config.total_steps
-        
-        # Calculate corruption type percentages from recent history
         recent_history = self.corruption_type_history[-100:] if len(self.corruption_type_history) > 0 else []
         corruption_percentages = {}
         if recent_history:
-            for corruption_type in ['clean', 'adversarial', 'gaussian']:
-                corruption_percentages[f'{corruption_type}_recent_pct'] = recent_history.count(corruption_type) / len(recent_history)
-        
-        # Validation gating information
-        validation_gating_info = {}
-        if self.validation_gating is not None:
+            for _ct in ['clean', 'adversarial', 'gaussian']:
+                corruption_percentages[f'{_ct}_recent_pct'] = recent_history.count(_ct) / len(recent_history)
+        # Validation gating snapshot from runtime (if present)
+        if self.curriculum_runtime is not None:
+            vg = self.curriculum_runtime.vg
             validation_gating_info = {
                 'validation_gating_enabled': self.curriculum_config.enable_validation_gating,
-                'intensity_multiplier': self.validation_gating.intensity_multiplier,
-                'validation_loss_ema': self.validation_gating.val_loss_ema,
-                'validation_accuracy_ema': self.validation_gating.val_accuracy_ema,
-                'consecutive_degradations': self.validation_gating.consecutive_degradations,
-                'rollback_count': self.validation_gating.rollback_count,
-                'last_adjustment_step': self.validation_gating.last_adjustment_step,
-                'performance_trend': self.validation_gating.performance_trend,
-                'effective_step': getattr(self, 'effective_step', self.training_step),
-                'curriculum_rollback_active': self.curriculum_rollback_target is not None
+                'intensity_multiplier': vg.intensity_multiplier if vg is not None else 1.0,
+                'validation_loss_ema': vg.val_loss_ema if vg is not None else None,
+                'validation_accuracy_ema': vg.val_accuracy_ema if vg is not None else None,
+                'consecutive_degradations': vg.consecutive_degradations if vg is not None else 0,
+                'rollback_count': vg.rollback_count if vg is not None else 0,
+                'last_adjustment_step': vg.last_adjustment_step if vg is not None else 0,
+                'performance_trend': vg.performance_trend if vg is not None else "stable",
+                'effective_step': self.curriculum_runtime.effective_step,
+                'curriculum_rollback_active': (self.curriculum_runtime.curriculum_rollback_target is not None)
             }
-            
-            # Add current stage baseline if available
-            if self.validation_gating.current_stage_baseline is not None:
+            if vg is not None and vg.current_stage_baseline is not None:
                 validation_gating_info.update({
-                    'stage_baseline_loss': self.validation_gating.current_stage_baseline['loss'],
-                    'stage_baseline_accuracy': self.validation_gating.current_stage_baseline['accuracy']
+                    'stage_baseline_loss': vg.current_stage_baseline['loss'],
+                    'stage_baseline_accuracy': vg.current_stage_baseline['accuracy']
                 })
         else:
             validation_gating_info = {
                 'validation_gating_enabled': False,
                 'intensity_multiplier': 1.0
             }
-        
         return {
             'curriculum_enabled': True,
             'current_step': self.training_step,
             'total_steps': self.curriculum_config.total_steps,
             'progress': progress,
             'current_stage': stage.name,
-            'stage_transition_step': self.stage_transition_step,
+            'stage_transition_step': getattr(self.curriculum_runtime, 'stage_transition_step', 0) if self.curriculum_runtime is not None else 0,
             'stage_ratios': {
                 'clean': stage.clean_ratio,
                 'adversarial': stage.adversarial_ratio,
@@ -1070,48 +622,20 @@ class GaussianDiffusion1D(nn.Module):
         }
 
     def get_validation_gating_summary(self) -> str:
-        """
-        Get a summary of validation gating status and recent adjustments.
-        
-        Returns:
-            Formatted string with validation gating information
-        """
-        if self.validation_gating is None:
+        if self.curriculum_runtime is None:
             return "Validation gating: Disabled"
-        
-        lines = [
-            f"Validation gating: {'Enabled' if self.curriculum_config.enable_validation_gating else 'Disabled'}",
-            f"Current intensity: {self.validation_gating.intensity_multiplier:.3f}",
-            f"Validation loss EMA: {self.validation_gating.val_loss_ema:.4f}" if self.validation_gating.val_loss_ema else "Validation loss EMA: Not available",
-            f"Validation accuracy EMA: {self.validation_gating.val_accuracy_ema:.4f}" if self.validation_gating.val_accuracy_ema else "Validation accuracy EMA: Not available",
-            f"Consecutive degradations: {self.validation_gating.consecutive_degradations}",
-            f"Total rollbacks: {self.validation_gating.rollback_count}"
-        ]
-        
-        if self.curriculum_rollback_target is not None:
-            lines.append(f"Active rollback: target step {self.curriculum_rollback_target}")
-        
-        # Add recent adjustments
-        adjustment_log = self.validation_gating.get_adjustment_log()
-        if adjustment_log != "No curriculum adjustments made.":
-            lines.append(adjustment_log)
-        
-        return "\n".join(lines)
+        return self.curriculum_runtime.get_validation_gating_summary()
 
     def reset_curriculum_tracking(self):
         """Reset curriculum tracking variables (useful for evaluation or new training)."""
         self.training_step = 0
         self.recent_energy_diffs = []
-        self.current_stage = None
-        self.stage_transition_step = 0
         self.corruption_type_history = []
         self.corruption_type_counts = {'clean': 0, 'adversarial': 0, 'gaussian': 0}
         
-        # Reset validation gating
-        if self.validation_gating is not None:
-            self.validation_gating = ValidationGatedCurriculum(self.curriculum_config)
-        self.effective_step = 0
-        self.curriculum_rollback_target = None
+        # Reset curriculum runtime
+        if self.curriculum_runtime is not None:
+            self.curriculum_runtime.reset()
 
     @torch.no_grad()
     def p_sample_loop(self, batch_size, shape, inp, cond, mask, return_traj=False):
