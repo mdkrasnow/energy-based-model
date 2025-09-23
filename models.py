@@ -688,7 +688,13 @@ class GNNConv1DEBMV2(nn.Module):
         # inp.shape == [B, N, N, inp_dim]
         # out.shape == [B, T, N, out_dim] or [B, N, N] for connectivity dataset
 
-        T, N = out.shape[1], out.shape[2]
+        # Handle both 3D and 4D out tensors
+        if len(out.shape) == 3:  # connectivity dataset: [B, N, N]
+            out = out.unsqueeze(-1)  # Make it [B, N, N, 1]
+            T, N = out.shape[1], out.shape[2]
+        else:  # other datasets: [B, T, N, out_dim]
+            T, N = out.shape[1], out.shape[2]
+        
         t_emb = self.time_mlp(t)
         t_emb = einops.repeat(t_emb, 'b c -> b t n1 c', t=T, n1=N)
         x = torch.cat([out, t_emb], dim=-1)
