@@ -91,16 +91,16 @@ if __name__ == "__main__":
 
     if FLAGS.dataset == "addition":
         dataset = Addition("train", FLAGS.rank, FLAGS.ood)
-        validation_dataset = dataset
+        validation_dataset = Addition("val", FLAGS.rank, FLAGS.ood)
         metric = 'mse'
     elif FLAGS.dataset == "inverse":
         dataset = Inverse("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = Inverse("val", FLAGS.rank, FLAGS.ood)
         metric = 'mse'
-        save_and_sample_every = 100  # Lower interval for short training runs
+        save_and_sample_every = 200
     elif FLAGS.dataset == "lowrank":
         dataset = LowRankDataset("train", FLAGS.rank, FLAGS.ood)
-        validation_dataset = dataset
+        validation_dataset = LowRankDataset("val", FLAGS.rank, FLAGS.ood)
         metric = 'mse'
     elif FLAGS.dataset == 'parents':
         dataset = FamilyDatasetWrapper(FamilyTreeDataset((12, 12), epoch_size=int(1e5), task='parents'))
@@ -118,6 +118,7 @@ if __name__ == "__main__":
         }
         validation_batch_size = 64
         metric = 'bce'
+        save_and_sample_every = 200
     elif FLAGS.dataset == 'connectivity-2':
         dataset = GraphDatasetWrapper(GraphConnectivityDataset((12, 12), 0.2, epoch_size=int(2048 * 1000), gen_method='dnc'))
         extra_validation_datasets = {
@@ -138,6 +139,7 @@ if __name__ == "__main__":
         dataset = train_dataset
         metric = 'sudoku'
         validation_batch_size = 64
+        save_and_sample_every = 200
         assert FLAGS.cond_mask
     elif FLAGS.dataset == 'sudoku-rrn':
         train_dataset = SudokuRRNDataset(FLAGS.dataset, split='train')

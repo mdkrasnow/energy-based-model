@@ -1542,7 +1542,21 @@ class Trainer1D(object):
                     if i > 20:
                         break
                 elif self.metric == 'bce':
-                    summary = binary_classification_accuracy_4(samples, label)
+                    # Handle GNN models that return 3D or 4D tensors
+                    if samples.dim() == 3 and label.dim() == 2:
+                        # For GNN connectivity models with 3D output: (batch_size, nodes, nodes)
+                        # Flatten to match label shape: (batch_size, nodes*nodes)
+                        batch_size = samples.shape[0]
+                        samples_processed = samples.reshape(batch_size, -1)
+                    elif samples.dim() == 4 and label.dim() == 2:
+                        # For GNN models with 4D output: (batch_size, channels, nodes, nodes)
+                        # Extract first channel and flatten
+                        batch_size = samples.shape[0]
+                        samples_processed = samples[:, 0, :, :].reshape(batch_size, -1)
+                    else:
+                        samples_processed = samples
+                    
+                    summary = binary_classification_accuracy_4(samples_processed, label)
                     for k, v in summary.items():
                         meters[k].update(v, n=samples.shape[0])
                     if i > 20:

@@ -732,9 +732,15 @@ class GNNConv1DReverse(nn.Module):
 
     def forward(self, inp, out, t):
         # inp.shape == [B, N, N, inp_dim]
-        # out.shape == [B, T, N, out_dim]
-
-        T, N = out.shape[1], out.shape[2]
+        # out.shape == [B, N, N] for connectivity or [B, T, N, out_dim] for other datasets
+        
+        # Handle both 3D and 4D out tensors
+        if len(out.shape) == 3:  # connectivity dataset: [B, N, N]
+            out = out.unsqueeze(-1)  # Make it [B, N, N, 1]
+            T, N = out.shape[1], out.shape[2]
+        else:  # other datasets: [B, T, N, out_dim]
+            T, N = out.shape[1], out.shape[2]
+        
         t_emb = self.time_mlp(t)
         t_emb = einops.repeat(t_emb, 'b c -> b t n1 c', t=T, n1=N)
         x = torch.cat([out, t_emb], dim=-1)
@@ -749,7 +755,7 @@ class GNNConv1DReverse(nn.Module):
 
     def randn(self, batch_size, shape, inp, device):
         n = inp.shape[-2]
-        return torch.randn((batch_size, 8, n, shape[0]), device=device)
+        return torch.randn((batch_size, n, n), device=device)
 
 
 class DiffusionWrapper(nn.Module):
@@ -847,4 +853,4 @@ class GNNConv1DV2DiffusionWrapper(nn.Module):
 
     def randn(self, batch_size, shape, inp, device):
         n = inp.shape[-2]
-        return torch.randn((batch_size, 8, n, shape[0]), device=device)
+        return torch.randn((batch_size, n, n), device=device)
