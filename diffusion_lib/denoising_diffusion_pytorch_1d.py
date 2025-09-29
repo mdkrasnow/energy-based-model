@@ -1378,6 +1378,8 @@ class Trainer1D(object):
 
     def evaluate(self, device, milestone, inp=None, label=None, mask=None):
         print('Running Evaluation...')
+        import sys
+        sys.stdout.flush()
         self.ema.ema_model.eval()
 
         if inp is not None and label is not None:
@@ -1394,7 +1396,9 @@ class Trainer1D(object):
 
                 all_samples = torch.cat(all_samples_list, dim = 0)
 
-                print(f'Validation Result @ Iteration {self.step}; Milestone = {milestone} (Train)')
+                print(f'Train Sample Evaluation @ Iteration {self.step}; Milestone = {milestone}')
+                import sys
+                sys.stdout.flush()
                 if self.metric == 'mse':
                     all_samples = torch.cat(all_samples_list, dim = 0)
                     
@@ -1426,11 +1430,20 @@ class Trainer1D(object):
                     summary = binary_classification_accuracy_4(all_samples_list[0], label)
                     rows = [[k, v] for k, v in summary.items()]
                     print(tabulate(rows))
+                    sys.stdout.flush()
+                    
+                    # Log to CSV
+                    if self.save_csv_logs:
+                        timestamp = datetime.now().isoformat()
+                        for metric_name, metric_value in summary.items():
+                            val_row = [self.step, milestone, 'train_sample', metric_name, metric_value, timestamp]
+                            self._log_to_csv(self.val_csv_path, val_row)
                 elif self.metric == 'sudoku':
                     assert len(all_samples_list) == 1
                     summary = sudoku_accuracy(all_samples_list[0], label, mask)
                     rows = [[k, v] for k, v in summary.items()]
                     print(tabulate(rows))
+                    sys.stdout.flush()
                     
                     # Log to CSV
                     if self.save_csv_logs:
@@ -1461,6 +1474,7 @@ class Trainer1D(object):
                     summary = sudoku_accuracy(prediction, label, mask)
                     rows = [[k, v] for k, v in summary.items()]
                     print(tabulate(rows))
+                    sys.stdout.flush()
                 else:
                     raise NotImplementedError()
 

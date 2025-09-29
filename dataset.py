@@ -256,6 +256,22 @@ class LowRankDataset(data.Dataset):
         self.inp_dim = self.h * self.w
         self.out_dim = self.h * self.w
         self.ood = ood
+        
+        # Define split-specific offsets to ensure no overlap
+        # Train: indices 0 to 999,999 (offset 0)
+        # Val: indices 1,000,000 to 1,999,999 (offset 1e6)
+        # Test: indices 2,000,000 to 2,999,999 (offset 2e6)
+        if split == "train":
+            self.index_offset = 0
+        elif split == "val" or split == "validation":
+            self.index_offset = int(1e6)
+        elif split == "test":
+            self.index_offset = int(2e6)
+        else:
+            self.index_offset = int(3e6)  # For any other split
+            
+        # Base seed for reproducibility
+        self.base_seed = 42
 
     def __getitem__(self, index):
         """Return a data point and its metadata information.
@@ -267,16 +283,24 @@ class LowRankDataset(data.Dataset):
             A(tensor) - - an image in one domain
             A_paths(str) - - the path of the image
         """
+        
+        # Create deterministic seed based on index and split
+        # This ensures each sample is reproducible and splits never overlap
+        actual_index = index + self.index_offset
+        seed = self.base_seed + actual_index
+        
+        # Create a local random state to avoid affecting global state
+        rng = np.random.RandomState(seed)
 
-        U = np.random.randn(self.h, 10)
-        V = np.random.randn(self.w, 10)
+        U = rng.randn(self.h, 10)
+        V = rng.randn(self.w, 10)
 
         if self.ood:
-            R = 0.1 * np.random.randn(self.h, self.w) + np.dot(U, V.T) / 5
+            R = 0.1 * rng.randn(self.h, self.w) + np.dot(U, V.T) / 5
         else:
-            R = 0.1 * np.random.randn(self.h, self.w) + np.dot(U, V.T) / 20
+            R = 0.1 * rng.randn(self.h, self.w) + np.dot(U, V.T) / 20
 
-        mask = np.round(np.random.rand(self.h, self.w))
+        mask = np.round(rng.rand(self.h, self.w))
 
         R_corrupt = R * mask
         return R_corrupt.flatten(), R.flatten()
@@ -344,6 +368,22 @@ class Addition(data.Dataset):
         self.split = split
         self.inp_dim = 2 * self.h * self.w
         self.out_dim = self.h * self.w
+        
+        # Define split-specific offsets to ensure no overlap
+        # Train: indices 0 to 999,999 (offset 0)
+        # Val: indices 1,000,000 to 1,999,999 (offset 1e6)
+        # Test: indices 2,000,000 to 2,999,999 (offset 2e6)
+        if split == "train":
+            self.index_offset = 0
+        elif split == "val" or split == "validation":
+            self.index_offset = int(1e6)
+        elif split == "test":
+            self.index_offset = int(2e6)
+        else:
+            self.index_offset = int(3e6)  # For any other split
+            
+        # Base seed for reproducibility
+        self.base_seed = 42
 
     def __getitem__(self, index):
         """Return a data point and its metadata information.
@@ -355,14 +395,22 @@ class Addition(data.Dataset):
             A(tensor) - - an image in one domain
             A_paths(str) - - the path of the image
         """
+        
+        # Create deterministic seed based on index and split
+        # This ensures each sample is reproducible and splits never overlap
+        actual_index = index + self.index_offset
+        seed = self.base_seed + actual_index
+        
+        # Create a local random state to avoid affecting global state
+        rng = np.random.RandomState(seed)
 
         if self.ood:
             scale = 2.5
         else:
             scale = 1.0
 
-        R_one = np.random.uniform(-scale, scale, (self.h, self.w)).flatten()
-        R_two = np.random.uniform(-scale, scale, (self.h, self.w)).flatten()
+        R_one = rng.uniform(-scale, scale, (self.h, self.w)).flatten()
+        R_two = rng.uniform(-scale, scale, (self.h, self.w)).flatten()
         R_corrupt = np.concatenate([R_one, R_two], axis=0)
         R = R_one + R_two
 

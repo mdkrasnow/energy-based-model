@@ -93,6 +93,7 @@ if __name__ == "__main__":
         dataset = Addition("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = Addition("val", FLAGS.rank, FLAGS.ood)
         metric = 'mse'
+        save_and_sample_every = 200
     elif FLAGS.dataset == "inverse":
         dataset = Inverse("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = Inverse("val", FLAGS.rank, FLAGS.ood)
@@ -102,6 +103,7 @@ if __name__ == "__main__":
         dataset = LowRankDataset("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = LowRankDataset("val", FLAGS.rank, FLAGS.ood)
         metric = 'mse'
+        save_and_sample_every = 200
     elif FLAGS.dataset == 'parents':
         dataset = FamilyDatasetWrapper(FamilyTreeDataset((12, 12), epoch_size=int(1e5), task='parents'))
         metric = 'bce'
@@ -110,6 +112,8 @@ if __name__ == "__main__":
         metric = 'bce'
     elif FLAGS.dataset == 'connectivity':
         dataset = GraphDatasetWrapper(GraphConnectivityDataset((12, 12), 0.1, epoch_size=int(2048 * 1000), gen_method='dnc'))
+        # Add proper validation dataset for connectivity
+        validation_dataset = GraphDatasetWrapper(GraphConnectivityDataset((12, 12), 0.1, epoch_size=int(1e4), gen_method='dnc'))
         extra_validation_datasets = {
             'connectivity-13': GraphDatasetWrapper(GraphConnectivityDataset((13, 13), 0.1, epoch_size=int(1e3), gen_method='dnc')),
             'connectivity-15': GraphDatasetWrapper(GraphConnectivityDataset((15, 15), 0.1, epoch_size=int(1e3), gen_method='dnc')),
@@ -119,8 +123,11 @@ if __name__ == "__main__":
         validation_batch_size = 64
         metric = 'bce'
         save_and_sample_every = 200
+        extra_validation_every_mul = 2  # Run extra validations more frequently
     elif FLAGS.dataset == 'connectivity-2':
         dataset = GraphDatasetWrapper(GraphConnectivityDataset((12, 12), 0.2, epoch_size=int(2048 * 1000), gen_method='dnc'))
+        # Add proper validation dataset for connectivity-2
+        validation_dataset = GraphDatasetWrapper(GraphConnectivityDataset((12, 12), 0.2, epoch_size=int(1e4), gen_method='dnc'))
         extra_validation_datasets = {
             'connectivity-13': GraphDatasetWrapper(GraphConnectivityDataset((13, 13), 0.2, epoch_size=int(1e3), gen_method='dnc')),
             'connectivity-15': GraphDatasetWrapper(GraphConnectivityDataset((15, 15), 0.2, epoch_size=int(1e3), gen_method='dnc')),
@@ -129,6 +136,7 @@ if __name__ == "__main__":
         }
         validation_batch_size = 64
         metric = 'bce'
+        extra_validation_every_mul = 2  # Run extra validations more frequently
     elif FLAGS.dataset.startswith('parity'):
         dataset = SATNetDataset(FLAGS.dataset)
         metric = 'bce'
