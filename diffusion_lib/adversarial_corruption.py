@@ -107,6 +107,155 @@ def _adversarial_corruption(
     return xmin_noise.detach()
 
 
+def _adversarial_corruption_lowrank(
+    ops: DiffusionOps,
+    inp: torch.Tensor,
+    x_start: torch.Tensor,
+    t: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    data_cond: Optional[torch.Tensor],
+    base_noise_scale: float,
+    epsilon: float,
+    rank: int
+) -> torch.Tensor:
+    """
+    Generate adversarial negatives for low-rank matrix completion.
+    Uses factorized parameterization X = U·V^T to preserve rank constraint.
+    
+    Args:
+        ops: Diffusion operations
+        inp: Input context (masked matrix)
+        x_start: Starting point (positive sample)
+        t: Diffusion timestep
+        mask: Optional mask for conditional generation
+        data_cond: Optional conditioning data
+        base_noise_scale: Noise scale for initial corruption
+        epsilon: Distance penalty weight
+        rank: Rank constraint (r in rank-r matrices)
+    
+    Returns:
+        Adversarial corrupted sample (guaranteed to be rank-r or less)
+    """
+    # Initial noise corruption
+    noise = torch.randn_like(x_start)
+    xmin_noise = ops.q_sample(x_start=x_start, t=t, noise=base_noise_scale * noise)
+    
+    if mask is not None:
+        xmin_noise = xmin_noise * (1 - mask) + mask * data_cond
+    
+    # Reshape to matrix form (assuming flattened input)
+    batch_size = xmin_noise.shape[0]
+    total_dim = xmin_noise.shape[1]
+    # Infer matrix dimensions (assume square matrix)
+    matrix_dim = int(total_dim ** 0.5)
+    assert matrix_dim * matrix_dim == total_dim, f"Input must be flattened square matrix, got {total_dim}"
+    
+    x_matrix = xmin_noise.reshape(batch_size, matrix_dim, matrix_dim)
+    
+    # Factorize: X = U·V^T using SVD for initialization
+    try:
+        U_full, S_full, Vt_full = torch.linalg.svd(x_matrix, full_matrices=False)
+        # Take only top-r components
+        U = U_full[:, :, :rank].clone()  # [B, m, r]
+        S_r = S_full[:, :rank].clone()   # [B, r]
+        V = Vt_full[:, :rank, :].transpose(1, 2).clone()  # [B, n, r]
+        
+        # Incorporate singular values into factors
+        S_sqrt = torch.sqrt(S_r + 1e-8).unsqueeze(1)  # [B, 1, r]
+        U = U * S_sqrt  # [B, m, r]
+        V = V * S_sqrt  # [B, n, r]
+    except:
+        # Fallback if SVD fails
+        U = torch.randn(batch_size, matrix_dim, rank, device=x_matrix.device) * 0.1
+        V = torch.randn(batch_size, matrix_dim, rank, device=x_matrix.device) * 0.1
+    
+    # Make factors require gradients
+    U.requires_grad_(True)
+    V.requires_grad_(True)
+    
+    # Store original for distance penalty
+    x_matrix_orig = x_matrix.clone().detach()
+    
+    # Get step size
+    opt_step_size = _extract(ops.opt_step_size, t, xmin_noise.shape)
+    
+    # Gradient ascent in factor space
+    for i in range(ops.anm_adversarial_steps):
+        # Reconstruct matrix from factors
+        x_reconstructed = torch.bmm(U, V.transpose(1, 2))  # [B, m, n]
+        
+        # Flatten for energy computation
+        x_flat = x_reconstructed.reshape(batch_size, -1)
+        
+        # Apply mask if present
+        if mask is not None:
+            x_flat = x_flat * (1 - mask) + mask * data_cond
+        
+        # Compute energy
+        energy = ops.model(inp, x_flat, t, return_energy=True)
+        
+        # Distance penalty to keep corruption bounded
+        distance = F.mse_loss(x_reconstructed, x_matrix_orig, reduction='none').sum(dim=[1, 2])
+        adaptive_penalty_weight = epsilon * torch.clamp(1.0 / (distance + 1e-6), 0.1, 2.0)
+        
+        # Total objective: maximize energy while limiting distance
+        objective = energy.sum() - (adaptive_penalty_weight * distance).sum()
+        
+        # Compute gradients w.r.t. factors
+        grads = torch.autograd.grad(
+            -objective,  # Negative because we want to maximize
+            [U, V],
+            create_graph=False,
+            retain_graph=False
+        )
+        grad_U, grad_V = grads
+        
+        # Gradient ascent step with decay
+        step_scale = 1.0 * (0.7 ** i)
+        
+        with torch.no_grad():
+            # Use step size
+            step_size_scalar = opt_step_size.mean()
+            
+            U = U - step_size_scalar * grad_U * step_scale
+            V = V - step_size_scalar * grad_V * step_scale
+            
+            # Apply clamping to maintain reasonable scale
+            if ops.continuous:
+                sf = 2.0
+            elif ops.shortest_path:
+                sf = 0.1
+            else:
+                sf = 1.0
+            
+            max_val = _extract(ops.sqrt_alphas_cumprod, t, xmin_noise.shape).mean()
+            max_val_factor = (max_val * sf) / (rank ** 0.5)  # Scale for factors
+            
+            U = torch.clamp(U, -max_val_factor, max_val_factor)
+            V = torch.clamp(V, -max_val_factor, max_val_factor)
+            
+            # Re-enable gradients for next iteration
+            if i < ops.anm_adversarial_steps - 1:
+                U.requires_grad_(True)
+                V.requires_grad_(True)
+    
+    # Final reconstruction
+    with torch.no_grad():
+        x_final = torch.bmm(U, V.transpose(1, 2))
+        x_final_flat = x_final.reshape(batch_size, -1)
+        
+        # Apply mask one final time
+        if mask is not None:
+            x_final_flat = x_final_flat * (1 - mask) + mask * data_cond
+        
+        # Verify no NaN values
+        if torch.any(torch.isnan(x_final_flat)):
+            # Fallback to standard corruption if something went wrong
+            return _adversarial_corruption(ops, inp, x_start, t, mask, data_cond, base_noise_scale, epsilon)
+    
+    return x_final_flat.detach()
+
+
 def enhanced_corruption_step_v2(
     ops: DiffusionOps,
     stage,
@@ -117,9 +266,25 @@ def enhanced_corruption_step_v2(
     mask: Optional[torch.Tensor],
     data_cond: Optional[torch.Tensor],
     base_noise_scale: float = 3.0,
+    constraint_config: Optional[object] = None,  # NEW parameter
 ) -> Tuple[CorruptionType, torch.Tensor]:
     """
-    Curriculum-aware dispatcher (returns noised sample). Behavior identical to inlined version.
+    Curriculum-aware dispatcher with optional constraint-aware corruption.
+    
+    Args:
+        ops: Diffusion operations
+        stage: Current curriculum stage
+        epsilon: Distance penalty parameter
+        inp: Input context
+        x_start: Starting point
+        t: Diffusion timestep
+        mask: Optional mask for conditional generation
+        data_cond: Optional conditioning data
+        base_noise_scale: Base noise scale
+        constraint_config: Optional ConstraintConfig for constraint-aware corruption
+        
+    Returns:
+        Tuple of (corruption_type, corrupted_sample)
     """
     corruption_type = _sample_corruption_type(stage)
 
@@ -128,8 +293,27 @@ def enhanced_corruption_step_v2(
     elif corruption_type == "gaussian":
         noise_scale = base_noise_scale * (2.0 / max(stage.temperature, 1.0))
         x_corrupted = _gaussian_noise_corruption(ops, x_start, t, noise_scale)
-    else:
-        x_corrupted = _adversarial_corruption(ops, inp, x_start, t, mask, data_cond, base_noise_scale, epsilon)
+    else:  # adversarial
+        # Check if constraint-aware corruption is enabled
+        if constraint_config is not None and constraint_config.enabled:
+            if constraint_config.constraint_type == 'low_rank':
+                rank = constraint_config.constraint_params.get('rank', 10)
+                x_corrupted = _adversarial_corruption_lowrank(
+                    ops, inp, x_start, t, mask, data_cond, 
+                    base_noise_scale, epsilon, rank
+                )
+            else:
+                # Fallback to unconstrained for unknown constraint types
+                x_corrupted = _adversarial_corruption(
+                    ops, inp, x_start, t, mask, data_cond, 
+                    base_noise_scale, epsilon
+                )
+        else:
+            # Standard unconstrained adversarial corruption
+            x_corrupted = _adversarial_corruption(
+                ops, inp, x_start, t, mask, data_cond, 
+                base_noise_scale, epsilon
+            )
 
     return corruption_type, x_corrupted
 

@@ -24,6 +24,9 @@ except ImportError:
     print("Warning: curriculum_config module not found. Curriculum features disabled.")
     CURRICULUM_AVAILABLE = False
 
+# Import constraint configuration
+from diffusion_lib.constraint_config import ConstraintConfig
+
 import argparse
 
 try:
@@ -78,6 +81,12 @@ parser.add_argument('--curriculum-config', type=str, default='default',
                    help='Choice of curriculum configuration (default: default)')
 parser.add_argument('--disable-curriculum', type=str2bool, default=False,
                    help='Boolean to force legacy behavior (default: False)')
+
+# Constraint-aware corruption arguments
+parser.add_argument('--use-constraint-parameterization', type=str2bool, default=False,
+                   help='Use constraint-preserving parameterization for adversarial corruption')
+parser.add_argument('--constraint-rank', type=int, default=10,
+                   help='Rank constraint for low-rank matrix tasks (used with constraint parameterization)')
 
 
 if __name__ == "__main__":
@@ -318,6 +327,20 @@ if __name__ == "__main__":
             print("Curriculum not available (curriculum_config module not found)")
         else:
             print("Using legacy training behavior")
+    
+    # Configure constraint-aware corruption
+    constraint_config = ConstraintConfig.from_flags(
+        use_constraint=FLAGS.use_constraint_parameterization,
+        rank=FLAGS.constraint_rank if FLAGS.dataset == 'lowrank' else FLAGS.rank,
+        dataset_name=FLAGS.dataset
+    )
+    
+    # Log constraint configuration
+    if constraint_config.enabled:
+        print(f"Using constraint-aware corruption: {constraint_config.constraint_type}")
+        print(f"Constraint parameters: {constraint_config.constraint_params}")
+    else:
+        print("Using standard unconstrained adversarial corruption")
 
     diffusion = GaussianDiffusion1D(
         model,
@@ -330,6 +353,7 @@ if __name__ == "__main__":
         show_inference_tqdm = False,
         curriculum_config = curriculum_config,
         disable_curriculum = FLAGS.disable_curriculum or FLAGS.curriculum_config == 'none',
+        constraint_config = constraint_config,  # Pass constraint configuration
         **kwargs
     )
 

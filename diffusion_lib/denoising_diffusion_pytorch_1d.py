@@ -202,6 +202,8 @@ class GaussianDiffusion1D(nn.Module):
         # Curriculum configuration
         curriculum_config = None,
         disable_curriculum = False,
+        # Constraint configuration for adversarial corruption
+        constraint_config = None,
     ):
         super().__init__()
         self.model = model
@@ -258,6 +260,9 @@ class GaussianDiffusion1D(nn.Module):
                 self.curriculum_config = None
         else:
             self.curriculum_config = curriculum_config
+            
+        # Store constraint configuration
+        self.constraint_config = constraint_config
             
         # Initialize curriculum runtime
         self.curriculum_runtime = None
@@ -520,6 +525,7 @@ class GaussianDiffusion1D(nn.Module):
             mask=mask,
             data_cond=data_cond,
             base_noise_scale=base_noise_scale,
+            constraint_config=self.constraint_config,  # Pass constraint config
         )
         self.corruption_type_history.append(corruption_type)
         if corruption_type in self.corruption_type_counts:

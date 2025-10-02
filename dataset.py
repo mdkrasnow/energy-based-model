@@ -251,11 +251,16 @@ class LowRankDataset(data.Dataset):
         """
         self.h = rank
         self.w = rank
+        self.rank = rank  # Store rank explicitly for constraint configuration
 
         self.split = split
         self.inp_dim = self.h * self.w
         self.out_dim = self.h * self.w
         self.ood = ood
+        
+        # Add constraint metadata for constraint-aware corruption
+        self.constraint_type = 'low_rank'
+        self.constraint_params = {'rank': rank}
         
         # Define split-specific offsets to ensure no overlap
         # Train: indices 0 to 999,999 (offset 0)
@@ -369,6 +374,10 @@ class Addition(data.Dataset):
         self.inp_dim = 2 * self.h * self.w
         self.out_dim = self.h * self.w
         
+        # Add constraint metadata - Addition is unconstrained
+        self.constraint_type = 'none'
+        self.constraint_params = {}
+        
         # Define split-specific offsets to ensure no overlap
         # Train: indices 0 to 999,999 (offset 0)
         # Val: indices 1,000,000 to 1,999,999 (offset 1e6)
@@ -481,6 +490,10 @@ class Inverse(data.Dataset):
         self.split = split
         self.inp_dim = self.h * self.w
         self.out_dim = self.h * self.w
+        
+        # Add constraint metadata - Inverse is unconstrained (though outputs should be inverses)
+        self.constraint_type = 'none'
+        self.constraint_params = {}
         
         # Define split-specific offsets to ensure no overlap
         # Train: indices 0 to 999,999 (offset 0)
