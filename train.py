@@ -102,17 +102,17 @@ if __name__ == "__main__":
         dataset = Addition("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = Addition("val", FLAGS.rank, FLAGS.ood)
         metric = 'mse'
-        save_and_sample_every = 200
+        save_and_sample_every = 1000
     elif FLAGS.dataset == "inverse":
         dataset = Inverse("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = Inverse("val", FLAGS.rank, FLAGS.ood)
         metric = 'mse'
-        save_and_sample_every = 200
+        save_and_sample_every = 1000
     elif FLAGS.dataset == "lowrank":
         dataset = LowRankDataset("train", FLAGS.rank, FLAGS.ood)
         validation_dataset = LowRankDataset("val", FLAGS.rank, FLAGS.ood)
         metric = 'mse'
-        save_and_sample_every = 200
+        save_and_sample_every = 1000
     elif FLAGS.dataset == 'parents':
         dataset = FamilyDatasetWrapper(FamilyTreeDataset((12, 12), epoch_size=int(1e5), task='parents'))
         metric = 'bce'

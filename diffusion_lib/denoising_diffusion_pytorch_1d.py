@@ -29,7 +29,6 @@ import numpy as np
 
 # Import curriculum configuration system
 from curriculum_config import CurriculumConfig, DEFAULT_CURRICULUM
-# from metrics_tracker import CurriculumMetricsTracker  # Removed enhanced metrics
 
 # NEW: modularized curriculum + corruption
 from .curriculum_runtime import CurriculumRuntime
