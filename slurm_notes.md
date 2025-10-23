@@ -6,6 +6,16 @@ ssh mkrasnow@login.rc.fas.harvard.edu
 # Enter password + OpenAuth token
 ```
 
+Running:
+
+Update file: `scp smoke_test_comparison_fixed.py mkrasnow@login.rc.fas.harvard.edu:~/smoke_test_comparison.py`
+
+Submit with `sbatch run_smoke_test.sh`
+Check status: `squeue -u mkrasnow`
+Monitor the output file: `tail -f smoke_test_42702260.out`
+Check for GPU utilization: `squeue -u $USER`
+Get error logs: `cat smoke_test_42702260.err`
+
 ## 📁 File Transfer
 
 ### Upload to Cluster
@@ -49,7 +59,7 @@ squeue -u mkrasnow
 squeue -j 12345678
 
 # Detailed job info
-scontrol show job 42566421
+scontrol show job 42605289
 ```
 
 ### Watch Job Output (Real-time)

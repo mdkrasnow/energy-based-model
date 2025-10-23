@@ -363,7 +363,8 @@ for task in TASKS:
     elif task in ['addition', 'lowrank']:
         display_cols.append('final_val_mae')
 
-    display(task_data[display_cols].round(4))
+    print(tabulate(task_data[display_cols].round(4), headers='keys', tablefmt='grid', showindex=False))
+
 
 
 # ## IRED Paper-Style Results Reporting
